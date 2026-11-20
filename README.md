@@ -11,8 +11,8 @@ projet perso. On l'installe une fois ; ensuite, dans un projet :
 
 Un seul bloc : `/devops-kit:devops-apply <bloc>` (par exemple `/devops-kit:devops-apply ci`).
 
-> État : **phase 1**. Blocs disponibles : `git-collab`, `ci`. Les blocs `docker-dev`, `cd-release` (phase 2),
-> `iac`, `monitoring` et `devsecops` (phase 3) apparaissent dans le diagnostic comme « pas encore disponibles ».
+> État : **phase 2**. Blocs disponibles : `git-collab`, `ci`, `docker-dev`, `cd-release`. Les blocs `iac`,
+> `monitoring` et `devsecops` (phase 3) apparaissent dans le diagnostic comme « pas encore disponibles ».
 
 ## Les blocs
 
@@ -20,6 +20,8 @@ Un seul bloc : `/devops-kit:devops-apply <bloc>` (par exemple `/devops-kit:devop
 |---|---|---|
 | `git-collab` | Ruleset sur `main` via `gh api` (PR obligatoire, squash, pas de force-push), CODEOWNERS, template de PR, hook `commit-msg` Conventional Commits, CONTRIBUTING.md | — |
 | `ci` | `.github/workflows/ci.yml` : lint, format, tests, seuil de couverture, intégration contre une vraie base, build, docker-build, cache, concurrency, permissions minimales ; checks requis ajoutés au ruleset | `git-collab` |
+| `docker-dev` | Dockerfile multi-stage non root, `.dockerignore`, `compose.yaml` de dev avec healthchecks, route `/health` (503 si la base ne répond pas), `.env.example` | — |
+| `cd-release` | `release.yml` : image ghcr.io au SHA court, scan Trivy, staging auto puis production après approbation, smoke test et rollback auto ; `compose.prod.yaml`, `deploy/` (scripts, Nginx HTTPS), `dependabot.yml`, `docs/DEPLOIEMENT.md` ; cible runner self-hosted local ou VPS en SSH | `docker-dev` (+ `ci` conseillé) |
 
 Stacks couvertes par chaque bloc : Node / Next.js, Next.js + Convex, Java (Maven, Gradle), Rust (cargo), Elixir (mix).
 
@@ -64,6 +66,7 @@ plugins/devops-kit/
   skills/<bloc>/references/            variantes par stack et explications
   skills/<bloc>/templates/             fichiers modèles commentés en français
 examples/node-api/                     mini-API Node sans aucun fichier DevOps, pour tester les blocs
+tests/                                 tests des scripts des templates (ex. tests/cd-release-deploy.sh, sans Docker)
 ```
 
 Écarts volontaires avec la structure de départ, suivant la documentation actuelle de Claude Code :

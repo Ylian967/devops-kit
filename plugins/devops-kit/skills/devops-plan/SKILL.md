@@ -16,8 +16,8 @@ Tout ce que tu écris à l'utilisateur est en français.
 |---|---|---|---|
 | `git-collab` | Ruleset sur `main`, CODEOWNERS, template de PR, hook Conventional Commits, CONTRIBUTING.md | — | oui |
 | `ci` | `.github/workflows/ci.yml` : lint, format, tests, couverture, intégration, build | `git-collab` (checks requis) | oui |
-| `docker-dev` | Dockerfiles multi-stage, compose.yaml de dev, `/health`, `.env.example` | — | phase 2 |
-| `cd-release` | Images ghcr.io, Trivy, staging puis prod avec approbation, smoke test, rollback | `ci`, `docker-dev` | phase 2 |
+| `docker-dev` | Dockerfiles multi-stage, compose.yaml de dev, `/health`, `.env.example` | — | oui |
+| `cd-release` | Images ghcr.io, Trivy, staging puis prod avec approbation, smoke test, rollback, proxy HTTPS, Dependabot | `docker-dev` (+ `ci` conseillé) | oui |
 | `iac` | OpenTofu pour le staging, `iac.yml`, Ansible en option | `cd-release` | phase 3 |
 | `monitoring` | `/metrics`, Prometheus, Grafana, Alertmanager, blackbox, post-mortem | `docker-dev` | phase 3 |
 | `devsecops` | gitleaks, audit des dépendances, Semgrep, ZAP, durcissement des workflows | `ci` | phase 3 |
