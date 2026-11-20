@@ -1,0 +1,53 @@
+# =============================================================================
+# .dockerignore : ce qui n'est PAS envoyé à Docker au moment du build
+#
+# Tout ce qui n'est pas exclu ici part dans le « contexte de build » et peut
+# finir dans l'image par un `COPY . .`. Exclure, c'est :
+#   - ne jamais copier un secret (.env, clés) dans une image publiée ;
+#   - ne pas écraser les dépendances installées DANS l'image par celles du poste
+#     (autre système, autre architecture : node_modules compilés pour macOS…) ;
+#   - des builds plus rapides et un cache qui ne saute pas à chaque fichier modifié.
+#
+# Modèle à ADAPTER : garder la partie commune et la section de la stack, supprimer les autres.
+# =============================================================================
+
+# --- Commun -------------------------------------------------------------------
+# Historique Git : inutile à l'image ; la version arrive par --build-arg APP_VERSION.
+.git
+.github
+.githooks
+# Secrets locaux : jamais dans une image.
+.env
+.env.*
+*.pem
+*.key
+# Fichiers Docker eux-mêmes : les modifier ne doit pas invalider le cache du code.
+Dockerfile*
+.dockerignore
+compose*.yaml
+docker-compose*.yml
+# Éditeurs, système, journaux, rapports
+.idea
+.vscode
+.DS_Store
+*.log
+coverage
+docs
+
+# --- Node / Next.js -------------------------------------------------------------
+node_modules
+.next
+dist
+.npm
+
+# --- Java (Maven / Gradle) et Rust : sorties de compilation --------------------
+target
+# Gradle seulement
+build
+.gradle
+
+# --- Elixir ---------------------------------------------------------------------
+_build
+deps
+# Assets compilés en local (régénérés par mix assets.deploy dans l'image)
+priv/static/assets

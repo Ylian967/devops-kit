@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Dockerfile : application Rust (axum, actix-web…) — build multi-stage avec cargo-chef
+#
+#   planner  calcule une « recette » (recipe.json) : la liste des dépendances,
+#            sans le code de l'application
+#   build    compile D'ABORD les dépendances d'après la recette (couche mise en
+#            cache tant que Cargo.toml / Cargo.lock ne bougent pas), PUIS le code
+#   runtime  distroless : le binaire + la libc, ni shell, ni gestionnaire de
+#            paquets, utilisateur `nonroot` (uid 65532)
+#
+# Sans cargo-chef, chaque modification d'une ligne de code recompilerait toutes
+# les dépendances (souvent plusieurs minutes). Alternative : cache mount, voir rust.md.
+#
+# Construire : docker build --build-arg APP_VERSION=$(git rev-parse --short=7 HEAD) -t monapp .
+# Modèle à ADAPTER : APP_BIN (nom du binaire dans Cargo.toml), version de Rust.
+# =============================================================================
+
+# Nom du binaire produit par cargo (section [[bin]] ou nom du paquet).
+ARG APP_BIN=monapp
+
+# ---------- chef : image commune (Rust + cargo-chef) ---------------------------
+# Version de Rust ET de cargo-chef figées dans le tag (Debian 13 « trixie », comme l'image finale).
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.100.0-slim-trixie AS chef
+WORKDIR /app
+
+# ---------- planner ----------------------------------------------------------------
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---------- build ------------------------------------------------------------------
+FROM chef AS build
+ARG APP_BIN
+COPY --from=planner /app/recipe.json recipe.json
+# Compile seulement les dépendances : c'est la couche longue, réutilisée tant que
+# la recette ne change pas. --locked : échoue si Cargo.lock n'est pas à jour.
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+COPY . .
+# sqlx avec query! : ajouter ENV SQLX_OFFLINE=true avant cette ligne (cache .sqlx/ versionné).
+RUN cargo build --release --locked --bin "${APP_BIN}" \
+ && cp "target/release/${APP_BIN}" /app/server
+
+# ---------- runtime ----------------------------------------------------------------
+# distroless/cc : glibc + libgcc + certificats CA, rien d'autre (~25 Mo).
+# Le tag `nonroot` bouge avec les correctifs : on fige le digest pour un build
+# reproductible (Renovate / Dependabot le mettent à jour).
+# Binaire statique (musl) : gcr.io/distroless/static-debian13:nonroot suffit.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2 AS runtime
+WORKDIR /app
+COPY --from=build /app/server /app/server
+
+ENV PORT=8080
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
+# `nonroot` (uid 65532) est défini par l'image ; on le répète en NUMÉRIQUE pour
+# que ce soit explicite et vérifiable sans /etc/passwd (Kubernetes, scanners).
+USER 65532:65532
+EXPOSE 8080
+
+# distroless n'a ni shell, ni curl, ni wget : c'est le BINAIRE lui-même qui fait
+# le healthcheck. Lancé avec l'argument `healthcheck`, il appelle
+# http://127.0.0.1:$PORT/health et sort en 0 (200) ou 1 (sinon).
+# Code à ajouter dans main.rs : voir references/rust.md (std seule, 15 lignes).
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["/app/server", "healthcheck"]
+
+ENTRYPOINT ["/app/server"]

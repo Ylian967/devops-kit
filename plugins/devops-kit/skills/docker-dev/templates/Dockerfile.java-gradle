@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Dockerfile : Spring Boot avec Gradle — build multi-stage
+#
+#   build    JDK + Gradle : bootJar, puis découpage du jar en couches (jarmode tools)
+#   runtime  JRE seul, utilisateur `app` non root
+#
+# Explications des couches et du healthcheck : voir Dockerfile.java-maven et
+# references/java.md. Seule l'étape build diffère.
+# Construire : docker build --build-arg APP_VERSION=$(git rev-parse --short=7 HEAD) -t monapp .
+# Modèle à ADAPTER : version de Java (= toolchain Gradle), nom du module.
+# =============================================================================
+
+# ---------- build ----------------------------------------------------------------
+# Image Gradle : la version de Gradle est celle de l'image. Si le projet a un
+# wrapper (gradlew), on l'utilise à la place pour garder SA version (voir java.md).
+FROM gradle:9.9.1-jdk21-noble AS build
+WORKDIR /src
+# D'abord les seuls fichiers de build : la résolution des dépendances reste en
+# cache tant qu'ils ne changent pas. Kotlin DSL ici ; Groovy : *.gradle.
+COPY settings.gradle.kts build.gradle.kts ./
+# Le cache Gradle (dépendances téléchargées) vit sur la machine de build.
+RUN --mount=type=cache,target=/home/gradle/.gradle gradle --no-daemon -q dependencies > /dev/null
+COPY src ./src
+# Tests : dans la CI, pas ici (-x test).
+# bootJar produit build/libs/<nom>-<version>.jar ; `jar` (plain) est désactivé
+# dans build.gradle.kts (tasks.jar { enabled = false }) pour n'avoir qu'UN jar.
+RUN --mount=type=cache,target=/home/gradle/.gradle gradle --no-daemon -q bootJar -x test \
+ && java -Djarmode=tools -jar build/libs/*.jar extract --layers --launcher --destination /layers
+
+# ---------- runtime ----------------------------------------------------------------
+FROM eclipse-temurin:21.0.13_9-jre-noble AS runtime
+RUN groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
+WORKDIR /app
+COPY --from=build /layers/dependencies/ ./
+COPY --from=build /layers/spring-boot-loader/ ./
+COPY --from=build /layers/snapshot-dependencies/ ./
+COPY --from=build /layers/application/ ./
+
+ENV PORT=8080 \
+    JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75"
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
+# Uid numérique : vérifiable sans lire /etc/passwd (Kubernetes runAsNonRoot, scanners).
+USER 10001:10001
+EXPOSE 8080
+
+# curl est présent dans l'image temurin ; -f : échec si HTTP ≥ 400 (voir Dockerfile.java-maven).
+HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=3 \
+  CMD ["sh", "-c", "curl -fsS -o /dev/null http://127.0.0.1:${PORT}/health"]
+
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]

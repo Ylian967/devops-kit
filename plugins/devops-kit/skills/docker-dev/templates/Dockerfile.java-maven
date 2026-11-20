@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Dockerfile : Spring Boot avec Maven — build multi-stage
+#
+#   build    JDK + Maven : compile, emballe le jar, puis le découpe en couches
+#            (dépendances / loader / snapshots / code) avec le jarmode « tools »
+#   runtime  JRE seul (pas de JDK, pas de Maven, pas de code source),
+#            utilisateur `app` non root
+#
+# Pourquoi les couches : les dépendances changent rarement, le code souvent. En
+# les copiant dans des couches séparées, un changement de code ne repousse que
+# la petite couche `application/` (quelques Ko) au lieu d'un jar de 50 Mo.
+# Prérequis : Spring Boot ≥ 3.3 (jarmode tools). Avant : voir references/java.md.
+#
+# Construire : docker build --build-arg APP_VERSION=$(git rev-parse --short=7 HEAD) -t monapp .
+# Modèle à ADAPTER : version de Java (= <java.version> du pom), modules, profil.
+# =============================================================================
+
+# ---------- build ----------------------------------------------------------------
+# Même version de Java que le projet et la CI. Versions précises, jamais `latest`.
+FROM maven:3.9.16-eclipse-temurin-21-noble AS build
+WORKDIR /src
+# D'abord le pom seul : la couche de téléchargement des dépendances reste en
+# cache tant que le pom ne change pas. Le cache ~/.m2 (--mount) survit d'un build
+# à l'autre sur la machine, sans grossir l'image.
+COPY pom.xml ./
+RUN --mount=type=cache,target=/root/.m2 mvn -B -q dependency:go-offline
+COPY src ./src
+# Les tests tournent dans la CI (jobs test et integration), pas ici :
+# -DskipTests garde le build d'image rapide et sans base de données.
+RUN --mount=type=cache,target=/root/.m2 mvn -B -q package -DskipTests \
+ && java -Djarmode=tools -jar target/*.jar extract --layers --launcher --destination /layers
+
+# ---------- runtime ----------------------------------------------------------------
+# JRE seulement : ~200 Mo de moins que le JDK, et pas de compilateur dans l'image.
+FROM eclipse-temurin:21.0.13_9-jre-noble AS runtime
+# Utilisateur système sans shell de connexion ni dossier personnel.
+RUN groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
+WORKDIR /app
+# Une COPY par couche, de la plus stable à la plus changeante (ordre important pour le cache).
+COPY --from=build /layers/dependencies/ ./
+COPY --from=build /layers/spring-boot-loader/ ./
+COPY --from=build /layers/snapshot-dependencies/ ./
+COPY --from=build /layers/application/ ./
+
+# PORT lu par Spring si application.properties contient server.port=${PORT:8080}.
+# MaxRAMPercentage : la JVM dimensionne son tas d'après la limite mémoire du
+# conteneur (75 %), pas d'après la RAM de la machine hôte.
+ENV PORT=8080 \
+    JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75"
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
+# Uid numérique : vérifiable sans lire /etc/passwd (Kubernetes runAsNonRoot, scanners).
+USER 10001:10001
+EXPOSE 8080
+
+# L'image eclipse-temurin (Ubuntu) contient déjà curl : on s'en sert.
+# -f : code de sortie non nul si HTTP ≥ 400 (503 → échec → unhealthy).
+# Image sans curl (autre base) : voir references/java.md (bash /dev/tcp).
+# start-period long : une appli Spring met souvent 10 à 30 s à démarrer.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=3 \
+  CMD ["sh", "-c", "curl -fsS -o /dev/null http://127.0.0.1:${PORT}/health"]
+
+# Lanceur Spring Boot pour les couches extraites (--launcher). Forme exec : la JVM
+# est le PID 1 et reçoit SIGTERM (arrêt propre, graceful shutdown de Spring).
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]

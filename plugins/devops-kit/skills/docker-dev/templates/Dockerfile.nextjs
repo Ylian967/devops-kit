@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Dockerfile : Next.js (sortie « standalone ») — build multi-stage
+#
+#   deps     toutes les dépendances (next build en a besoin)
+#   build    next build → .next/standalone : un server.js + le strict minimum de
+#            node_modules, tracé par Next (quelques dizaines de Mo au lieu de centaines)
+#   runtime  Node + standalone + fichiers statiques, utilisateur `node` (non root)
+#
+# PRÉREQUIS dans next.config.(js|ts) :   output: 'standalone'
+# Construire : docker build --build-arg APP_VERSION=$(git rev-parse --short=7 HEAD) -t monapp .
+# Modèle à ADAPTER : variables NEXT_PUBLIC_*, dossier public/, gestionnaire de paquets.
+# =============================================================================
+
+ARG NODE_IMAGE=node:22.23.5-alpine3.24
+
+# ---------- deps ---------------------------------------------------------------
+FROM ${NODE_IMAGE} AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+# ---------- build --------------------------------------------------------------
+FROM ${NODE_IMAGE} AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+# Les variables NEXT_PUBLIC_* sont RECOPIÉES dans le JavaScript envoyé au
+# navigateur au moment de `next build` : elles doivent exister ICI, pas au
+# démarrage du conteneur. Elles sont publiques par nature : jamais de secret.
+# Exemple (à décommenter / adapter) :
+# ARG NEXT_PUBLIC_API_URL
+# ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+# ---------- runtime ------------------------------------------------------------
+FROM ${NODE_IMAGE} AS runtime
+# HOSTNAME=0.0.0.0 : le server.js standalone écoute sinon sur le nom du conteneur
+# seulement ; 0.0.0.0 le rend joignable par le port publié ET par le healthcheck.
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+WORKDIR /app
+# standalone ne contient NI public/ NI .next/static : il faut les recopier à côté.
+# Pas de dossier public/ dans le projet : supprimer cette ligne (sinon COPY échoue).
+COPY --from=build /app/public ./public
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
+# `node` (uid 1000) existe dans l'image officielle ; uid numérique (voir Dockerfile.node).
+USER 1000:1000
+EXPOSE 3000
+
+# /health est servi par le route handler app/health/route.ts (voir references/node.md).
+# fetch() est intégré à Node : pas besoin de curl dans l'image.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+
+# server.js est généré par next build (output: 'standalone').
+CMD ["node", "server.js"]

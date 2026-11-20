@@ -1,0 +1,82 @@
+# =============================================================================
+# compose.yaml : environnement de DÉVELOPPEMENT (app + PostgreSQL) en une commande
+#
+#   docker compose up -d --build   # construit l'image et démarre db puis app
+#   docker compose ps              # état : app doit être « healthy »
+#   docker compose logs -f app     # suivre les logs de l'application
+#   docker compose down            # arrête et supprime les conteneurs (données gardées)
+#   docker compose down -v         # idem + supprime le volume pgdata (EFFACE la base)
+#
+# Application : http://127.0.0.1:3000/health
+#
+# Les services se joignent PAR LEUR NOM sur le réseau privé que Compose crée :
+# l'application contacte la base à l'adresse `db`, pas `localhost`.
+#
+# ${VAR:-défaut} : valeur lue dans .env (ou l'environnement), sinon le défaut.
+# C'est acceptable ICI, en dev : les défauts sont des valeurs factices, la base
+# n'est pas publiée, et `docker compose up` marche sans aucune préparation.
+# JAMAIS en staging / production (compose.prod.yaml, bloc cd-release) : un .env
+# oublié y démarrerait la base avec le mot de passe connu de tous. Là-bas on
+# écrit ${VAR:?message} : Compose refuse de démarrer si la variable manque.
+#
+# Modèle à ADAPTER : nom du projet, port, variables lues par l'application.
+# =============================================================================
+
+# Nom du projet Compose (préfixe des conteneurs, du réseau et du volume).
+# Convention devops-kit : <repo>-<env> ; ici l'environnement est `local`.
+name: monapp-local
+
+services:
+  # ---------- Base de données ------------------------------------------------
+  db:
+    # Même version majeure qu'en CI et en production.
+    image: postgres:17-alpine
+    # Lues par l'image au PREMIER démarrage (volume vide) pour créer l'utilisateur
+    # et la base. Les changer ensuite n'a aucun effet sans `docker compose down -v`.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+    # Volume NOMMÉ : les données survivent à `docker compose down` et aux rebuilds.
+    # (PostgreSQL 18+ : monter sur /var/lib/postgresql au lieu de …/data.)
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # « Prête à accepter des connexions ? » : un conteneur démarré n'est pas une base prête.
+    # $$ : le $ est passé tel quel au conteneur, qui lit SA variable d'environnement.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    # Pas de `ports:` : la base n'est joignable QUE par les services de ce fichier.
+    # Besoin d'un client SQL depuis le poste ? Décommenter, et toujours sur 127.0.0.1
+    # (sans cette adresse, Docker publie sur toutes les interfaces, Wi-Fi compris,
+    # et contourne le pare-feu de la machine).
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+  # ---------- Application ----------------------------------------------------
+  app:
+    build:
+      context: .
+      args:
+        APP_VERSION: dev
+    environment:
+      PORT: "3000"
+      APP_ENV: local
+      APP_VERSION: dev
+      # L'hôte est `db` (le nom du service). Mêmes variables que le service db.
+      DATABASE_URL: postgres://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-app}
+    # Publié sur 127.0.0.1 seulement : accessible depuis le poste, pas depuis le réseau local.
+    ports:
+      - "127.0.0.1:${APP_PORT:-3000}:3000"
+    # L'application ne démarre qu'une fois la base HEALTHY (pas seulement démarrée).
+    depends_on:
+      db:
+        condition: service_healthy
+    # Le HEALTHCHECK vient du Dockerfile : inutile de le répéter ici.
+    restart: unless-stopped
+
+volumes:
+  pgdata:

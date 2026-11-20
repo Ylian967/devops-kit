@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Dockerfile : Phoenix (Elixir) avec `mix release` — build multi-stage
+#
+#   build    Elixir + Erlang + outils de compilation : deps, assets, `mix release`
+#   runtime  Debian slim + la release (elle embarque son propre runtime Erlang :
+#            ni Elixir ni mix dans l'image finale), utilisateur `app` non root
+#
+# Prérequis : `mix phx.gen.release` a été lancé une fois. Il crée
+#   lib/<app>/release.ex       (fonction migrate/0)
+#   rel/overlays/bin/server    (démarre le serveur avec PHX_SERVER=true)
+#   rel/overlays/bin/migrate   (joue les migrations Ecto)
+#
+# Construire : docker build --build-arg APP_VERSION=$(git rev-parse --short=7 HEAD) -t monapp .
+# Modèle à ADAPTER : APP_NAME, versions, présence d'assets/.
+# =============================================================================
+
+# Nom de l'application = `app:` dans mix.exs (aussi le nom de la release).
+ARG APP_NAME=mon_app
+
+# ---------- build ------------------------------------------------------------------
+# Image hexpm : versions d'Elixir, d'Erlang/OTP et de Debian toutes figées dans le tag.
+# La date Debian du tag DOIT être la même que celle de l'image runtime (mêmes libs).
+FROM hexpm/elixir:1.19.7-erlang-28.5.0.8-debian-trixie-20261104-slim AS build
+# Outils de compilation pour les dépendances natives (NIF) ; git pour les deps git.
+# Les versions des paquets apt suivent l'image Debian datée : on ne les épingle pas.
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential git \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+ENV MIX_ENV=prod
+RUN mix local.hex --force && mix local.rebar --force
+
+# Dépendances d'abord (cache tant que mix.exs / mix.lock ne changent pas).
+COPY mix.exs mix.lock ./
+RUN mix deps.get --only prod
+# La config de compilation est lue AVANT de compiler les deps.
+# runtime.exs vient plus tard : il n'est lu qu'au démarrage de la release.
+COPY config/config.exs config/prod.exs config/
+RUN mix deps.compile
+
+COPY priv priv
+COPY lib lib
+RUN mix compile
+# Phoenix avec assets (esbuild / tailwind) : sans dossier assets/, supprimer ces deux lignes.
+# Après la compilation : Phoenix 1.8 extrait des hooks JS du code compilé.
+COPY assets assets
+RUN mix assets.deploy
+
+COPY config/runtime.exs config/
+COPY rel rel
+RUN mix release
+
+# ---------- runtime ----------------------------------------------------------------
+FROM debian:trixie-20261104-slim AS runtime
+ARG APP_NAME
+# Bibliothèques dont le runtime Erlang a besoin (C++, TLS, terminal) + certificats CA.
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libstdc++6 openssl libncurses6 ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app
+# C.UTF-8 est inclus dans Debian : pas besoin du paquet locales. Sans UTF-8, les
+# accents des chaînes Elixir s'affichent mal dans les logs.
+ENV LANG=C.UTF-8 \
+    MIX_ENV=prod \
+    PORT=4000
+WORKDIR /app
+# La release écrit dans son dossier tmp/ au démarrage : elle appartient à `app`.
+COPY --from=build --chown=app:app /app/_build/prod/rel/${APP_NAME} ./
+
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
+# Uid numérique : vérifiable sans lire /etc/passwd (Kubernetes runAsNonRoot, scanners).
+USER 10001:10001
+EXPOSE 4000
+
+# debian-slim n'a ni curl ni wget, mais a bash : /dev/tcp ouvre une connexion TCP.
+# Requête HTTP/1.0 minimale vers /health ; on exige « 200 » sur la ligne de statut.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
+  CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${PORT} && printf 'GET /health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+
+# Migrations AU DÉMARRAGE, puis le serveur. `exec` remplace le shell par la
+# release : elle devient le PID 1 et reçoit SIGTERM. Si les migrations échouent,
+# le conteneur s'arrête au lieu de servir une base au mauvais schéma.
+# Plusieurs réplicas : sortir `bin/migrate` dans une tâche unique (voir elixir.md).
+CMD ["sh", "-c", "bin/migrate && exec bin/server"]
