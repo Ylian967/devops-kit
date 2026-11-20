@@ -1,0 +1,21 @@
+# .zap/rules.tsv : décision du projet pour chaque règle du scan ZAP baseline.
+# Format : ID<TAB>ACTION<TAB>justification (séparateur = TABULATION, pas des espaces).
+# ACTION : FAIL (fait échouer le job dast), WARN (signalé, ne bloque pas : option -I),
+#          INFO (signalé à titre informatif), IGNORE (faux positif trié, non signalé).
+# Règle absente du fichier = WARN (comportement par défaut de zap-baseline.py).
+# Méthode : une alerte CORRIGÉE passe en FAIL (elle ne peut plus revenir sans casser le job) ;
+# un IGNORE n'est posé qu'après triage, et repris dans docs/SECURITE.md (quoi, pourquoi, qui, date).
+# Les FAIL ci-dessous supposent deploy/nginx/security-headers.conf DÉPLOYÉ sur le staging.
+# Liste des règles et de leurs ID : https://www.zaproxy.org/docs/alerts/
+10038	FAIL	Content-Security-Policy absente : posée par security-headers.conf
+10055	WARN	CSP présente mais faible (unsafe-inline, joker) : à examiner, ne bloque pas (Next.js : unsafe-inline assumé ?)
+10020	FAIL	Anti-clickjacking (X-Frame-Options / frame-ancestors) absent : posé par security-headers.conf
+10021	FAIL	X-Content-Type-Options absent : posé par security-headers.conf
+10063	FAIL	Permissions-Policy absent : posé par security-headers.conf
+10035	FAIL	Strict-Transport-Security absent : posé par app.conf (cd-release)
+10036	FAIL	Version du serveur dans l'en-tête Server : server_tokens off
+10037	FAIL	X-Powered-By présent : retiré par proxy_hide_header
+90004	WARN	Isolation d'origine (COOP/COEP/CORP) incomplète : COEP volontairement absent, voir security-headers.conf
+10049	INFO	Contenu stockable en cache : informatif, à revoir si une page privée est mise en cache
+10109	INFO	Application web moderne détectée : informatif (conseille le spider Ajax)
+10027	WARN	Commentaires suspects : souvent dans un bundle minifié de dépendance ; trier avant tout IGNORE

@@ -1,0 +1,273 @@
+# =============================================================================
+# .github/workflows/security.yml : contrôles de sécurité (variante Node / Next.js)
+#
+# Quatre familles de contrôles, un job chacune. Les `name:` sont STABLES : ce
+# sont les noms des checks du ruleset de main (les renommer bloque les PR).
+#   secrets       gitleaks sur TOUT l'historique Git             requis
+#   dependencies  audit des dépendances, bloque high/critical     requis
+#   sast          Semgrep (analyse statique du code)              requis
+#   dast          OWASP ZAP baseline contre le STAGING            non requis (ne tourne pas sur les PR)
+#
+# Autres stacks : seuls les jobs `dependencies` et `sast` changent ; les blocs
+# à coller sont dans references/<stack>.md du bloc devsecops.
+#
+# Toutes les actions sont épinglées par SHA de commit complet, la version en
+# commentaire : un tag peut être déplacé vers du code malveillant, un SHA non.
+# Dependabot (package-ecosystem: github-actions) met à jour le SHA ET le commentaire.
+# =============================================================================
+
+name: Sécurité
+
+on:
+  # Sur chaque PR, sans filtre de chemins (sinon les checks requis ne tournent pas).
+  # `pull_request` et JAMAIS `pull_request_target` : le code d'une PR venue d'un
+  # fork tourne sans secrets et avec un jeton en lecture seule.
+  pull_request:
+  push:
+    branches: [main]
+  # Chaque semaine : une dépendance saine aujourd'hui peut recevoir une CVE demain,
+  # sans que personne ne touche au code. C'est aussi le créneau du scan ZAP.
+  # Minute « bizarre » : moins de file d'attente qu'à l'heure pile.
+  schedule:
+    - cron: "23 5 * * 1" # lundi 5 h 23 UTC
+  # Bouton « Run workflow » ; release.yml peut aussi le déclencher après un
+  # déploiement du staging (gh workflow run security.yml), voir le SKILL.md.
+  workflow_dispatch:
+
+# Moindre privilège : AUCUN droit au niveau du workflow ; chaque job demande
+# le strict nécessaire. Un step compromis n'a que les droits de son job.
+permissions: {}
+
+# Un nouveau push sur la PR annule le run précédent, devenu inutile.
+# Sur main et en planifié, on n'annule jamais : chaque run va au bout.
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ---------- secrets : gitleaks sur tout l'historique ------------------------
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # garde-fou : un job bloqué ne consomme pas 6 h de minutes
+    permissions:
+      contents: read # cloner le dépôt, rien d'autre
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # Empreinte SHA-256 de l'archive linux_x64 de CETTE version, écrite ici en dur :
+      # une archive remplacée sur la page de release ne passerait pas la vérification.
+      # Nouvelle version : gh api repos/gitleaks/gitleaks/releases/tags/v<X.Y.Z> \
+      #   --jq '.assets[] | select(.name|endswith("linux_x64.tar.gz")) | .digest'
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # TOUT l'historique : un secret « supprimé » reste dans les anciens commits
+          persist-credentials: false # le jeton n'est pas laissé dans .git/config
+
+      # Binaire officiel plutôt que gitleaks/gitleaks-action : l'action exige une
+      # licence (GITLEAKS_LICENSE) dès que le dépôt appartient à une organisation.
+      - name: Installer gitleaks
+        run: |
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$archive"
+          echo "${GITLEAKS_SHA256}  $archive" | sha256sum -c -   # échoue si l'empreinte diffère
+          tar -xzf "$archive" gitleaks
+
+      # .gitleaks.toml (règles par défaut + exceptions étroites) et .gitleaksignore
+      # (empreintes de fuites déjà traitées) sont lus automatiquement à la racine.
+      # --redact : le secret n'apparaît pas en clair dans les logs ni dans le rapport.
+      # Code de sortie 1 s'il y a une fuite => job rouge.
+      # Vérifier dans le log « N commits scanned » : 0 commit = rien n'a été lu.
+      - name: Scanner l'historique
+        run: ./gitleaks git --redact --verbose --report-format sarif --report-path gitleaks.sarif .
+
+      # Résumé affiché sur la page du run (onglet Summary), même si le scan a échoué.
+      - name: Résumé
+        if: ${{ !cancelled() && hashFiles('gitleaks.sarif') != '' }}
+        run: |
+          n=$(jq '[.runs[].results[]] | length' gitleaks.sarif)
+          echo "### gitleaks : $n fuite(s) dans l'historique" >> "$GITHUB_STEP_SUMMARY"
+          echo "Détail : artefact rapport-gitleaks ; procédure : docs/SECURITE.md." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rapport gitleaks
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rapport-gitleaks
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+  # ---------- dependencies : CVE connues dans les dépendances (SCA) -----------
+  dependencies:
+    name: dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # npm audit lit package-lock.json : pas besoin de `npm ci` (donc aucun script
+      # d'installation de paquet n'est exécuté). Le npm du runner suffit.
+      # 1) Rapport JSON complet, TOUTES dépendances et sévérités, pour le triage.
+      #    `|| true` : ce step informe, il ne bloque pas.
+      - name: Rapport complet (JSON)
+        run: npm audit --json > npm-audit.json || true
+
+      - name: Résumé
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "### npm audit (toutes dépendances, dev comprises)"
+            echo "| critical | high | moderate | low |"
+            echo "|---|---|---|---|"
+            jq -r '.metadata.vulnerabilities | "| \(.critical) | \(.high) | \(.moderate) | \(.low) |"' npm-audit.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 2) Le contrôle BLOQUANT : code 1 s'il existe une vulnérabilité high ou critical
+      #    dans les dépendances livrées en production.
+      #    --omit=dev : les devDependencies (tests, lint) ne partent pas en production ;
+      #    leurs alertes restent visibles dans le rapport ci-dessus et dans Dependabot.
+      #    Front dont le bundle est construit à partir de devDependencies (Vite, SPA) :
+      #    retirer --omit=dev (references/node.md).
+      #    pnpm : `pnpm audit --audit-level high --prod` ;
+      #    yarn Berry : `yarn npm audit --recursive --severity high --environment production`.
+      - name: Bloquer sur high / critical
+        run: npm audit --audit-level=high --omit=dev
+
+      - name: Rapport npm audit
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rapport-npm-audit
+          path: npm-audit.json
+          if-no-files-found: ignore
+
+  # ---------- sast : Semgrep, analyse statique du code ------------------------
+  sast:
+    name: sast
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # security-events: write sert UNIQUEMENT à envoyer le SARIF dans l'onglet
+      # Security > Code scanning (gratuit sur un dépôt public). Dépôt privé sans
+      # GitHub Advanced Security : supprimer la ligne et le step « Envoyer dans Code scanning ».
+      security-events: write # envoi du SARIF (Code scanning)
+    # Le job tourne DANS l'image officielle de Semgrep : rien à installer, aucun compte.
+    # Tag lisible + digest : le digest fige le contenu (un tag d'image se republie).
+    # Nouvelle version : docker buildx imagetools inspect semgrep/semgrep:<version>
+    container:
+      image: semgrep/semgrep:1.186.0@sha256:6e1b04340e60e910fbb4ddbf3c857ab0918f064417ad5ac530014ccb3cf8c8f1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Règles publiques du registre Semgrep, téléchargées sans compte ni jeton :
+      #   p/javascript (JS, Express, Node), p/nodejsscan (njsscan : SQLi, XSS, exec, eval…).
+      #   TypeScript / Next.js : ajouter --config p/typescript --config p/react.
+      # --error : code 1 s'il y a au moins un résultat => job rouge.
+      # --metrics=off : aucune télémétrie envoyée à Semgrep.
+      # Faux positif : `// nosemgrep: <id-de-la-règle>` sur la ligne, justifié dans docs/SECURITE.md.
+      - name: Analyse statique
+        run: >-
+          semgrep scan
+          --config p/javascript
+          --config p/nodejsscan
+          --metrics=off
+          --error
+          --sarif-output=semgrep.sarif
+          --text-output=semgrep.txt
+
+      - name: Résumé
+        if: ${{ !cancelled() && hashFiles('semgrep.txt') != '' }}
+        run: |
+          {
+            echo "### Semgrep"
+            echo '```'
+            cat semgrep.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Les résultats apparaissent dans l'onglet Security, annotés sur la PR.
+      # Sautée pour une PR de fork et pour Dependabot : leur jeton est toujours en
+      # lecture seule, l'envoi échouerait.
+      - name: Envoyer dans Code scanning
+        if: ${{ !cancelled() && hashFiles('semgrep.sarif') != '' && !github.event.pull_request.head.repo.fork && github.actor != 'dependabot[bot]' }}
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Rapport Semgrep
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rapport-semgrep
+          path: semgrep.*
+          if-no-files-found: ignore
+
+  # ---------- dast : OWASP ZAP baseline contre le staging ---------------------
+  # Baseline = scan PASSIF : ZAP explore le site (spider) et analyse les réponses
+  # (en-têtes, cookies, fuites d'information) SANS envoyer d'attaque : sûr sur un
+  # staging partagé. Il scanne ce qui est DÉPLOYÉ (proxy et en-têtes compris),
+  # pas le code de la PR : il ne tourne donc qu'en planifié ou à la demande
+  # (et après un déploiement du staging si release.yml le déclenche).
+  # Sauté tant que la variable de dépôt STAGING_URL n'existe pas.
+  dast:
+    name: dast
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.STAGING_URL != '' }}
+    # Staging joignable depuis Internet (VPS) : ubuntu-latest.
+    # Staging sur votre machine (cible runner de cd-release) : [self-hosted, deploy],
+    # voir le SKILL.md (dossier de travail de ZAP).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # lire .zap/rules.tsv
+    env:
+      # Variable de DÉPÔT (Settings → Secrets and variables → Actions → Variables),
+      # ex. https://staging.example.com ; ce n'est pas un secret.
+      DAST_URL: ${{ vars.STAGING_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Échouer clairement si le staging est éteint, plutôt qu'un rapport ZAP vide.
+      # -k : certificat auto-signé accepté (runner local) ; on teste que l'app répond.
+      - name: Vérifier que le staging répond
+        run: curl -fsSk --retry 5 --retry-delay 5 --retry-all-errors "$DAST_URL/health"
+
+      # .zap/rules.tsv : décision règle par règle (IGNORE, INFO, WARN, FAIL).
+      # -I : les WARN ne font PAS échouer le job, seuls les FAIL le font. Une baseline
+      # remonte beaucoup d'alertes de contexte (cache, commentaires dans un bundle
+      # minifié…) : bloquer sur toutes pousse à tout passer en IGNORE. On bloque donc
+      # sur ce qu'on a corrigé (FAIL = test de non-régression), le reste est trié.
+      # --network host : en self-hosted, ZAP joint localhost de la machine.
+      # ZAP tourne en utilisateur « zap » (uid 1000) : le dossier doit lui être inscriptible.
+      # Image épinglée par tag ET digest, comme Semgrep.
+      - name: Scan ZAP baseline
+        run: |
+          mkdir -p zap && cp .zap/rules.tsv zap/ && chmod -R a+rwx zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af \
+            zap-baseline.py -t "$DAST_URL" -c rules.tsv -I \
+              -r zap-rapport.html -J zap-rapport.json -w zap-rapport.md
+
+      # Le rapport Markdown sur la page du run, même quand un FAIL a fait échouer le scan.
+      - name: Résumé
+        if: ${{ !cancelled() && hashFiles('zap/zap-rapport.md') != '' }}
+        run: cat zap/zap-rapport.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rapport ZAP
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rapport-zap
+          path: zap/zap-rapport.*
+          if-no-files-found: ignore

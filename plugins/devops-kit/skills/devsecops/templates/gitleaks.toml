@@ -1,0 +1,50 @@
+# =============================================================================
+# .gitleaks.toml : configuration de gitleaks (lue automatiquement à la racine,
+# par le hook pre-commit comme par le job `secrets` de security.yml).
+#
+# On GARDE toutes les règles par défaut (~200 : jetons GitHub, AWS, Slack,
+# Stripe, clés privées…) et on n'ajoute que des exceptions ÉTROITES :
+#   - une exception vise un chemin ET une valeur précise, jamais une règle entière ;
+#   - chaque exception est reprise dans docs/SECURITE.md (quoi, pourquoi, qui, revue) ;
+#   - un VRAI secret ne s'ajoute jamais ici : il se révoque (docs/SECURITE.md).
+# Tester une modification : un faux secret dans un fichier doit TOUJOURS être trouvé.
+# =============================================================================
+
+title = "gitleaks du projet"
+
+# Hérite de la configuration par défaut de gitleaks (toutes les règles).
+[extend]
+useDefault = true
+
+# --- Exception 1 : valeurs factices des fichiers d'exemple -------------------
+# On n'exempte PAS le chemin .env.example : une exception `paths` fait sauter le
+# fichier ENTIER, même avec condition = "AND" (vérifié avec gitleaks 8.30.1 : une
+# vraie clé AWS collée dans .env.example n'était plus trouvée).
+# On exempte la VALEUR : la chaîne détectée contient un mot de remplacement.
+# Une vraie clé ne contient jamais « changeme » : elle reste détectée partout.
+[[allowlists]]
+description = "Valeurs factices (fichiers d'exemple, documentation)"
+regexTarget = "secret" # la regex s'applique à la valeur détectée, pas à la ligne
+regexes = [
+  '''(?i)(change[-_]?me|a[-_]?changer|placeholder|dummy|factice|xxxx+|<[^>]+>)''',
+]
+
+# --- Exception 2 : identifiants des bases jetables de la CI et du dev --------
+# `app:app` = utilisateur/mot de passe du service PostgreSQL de ci.yml et du
+# compose.yaml de dev : base éphémère, jamais exposée. On vise la chaîne EXACTE.
+# regexTarget = "match" (et pas "line") : un vrai jeton collé sur la même ligne
+# a son propre « match » qui ne contient pas l'URL ; il reste donc détecté.
+[[allowlists]]
+description = "URL de connexion des bases jetables (CI, dev) : app:app"
+regexTarget = "match"
+regexes = [
+  '''postgres(ql)?://app:app@(localhost|127\.0\.0\.1|db|postgres)(:\d+)?/''',
+]
+
+# --- Ce qu'on n'ajoute PAS ---------------------------------------------------
+# - les lockfiles (package-lock.json…) : gitleaks n'y trouve en pratique rien,
+#   et un jeton dans une URL de registre privé (`_authToken`) DOIT être trouvé ;
+# - un dossier entier (tests/, fixtures/) : si un test a besoin d'un faux secret,
+#   l'exception vise CE fichier et CETTE valeur ;
+# - un faux positif ponctuel dans un vieux commit : ajouter son empreinte
+#   (colonne Fingerprint du rapport) dans .gitleaksignore, une ligne commentée par entrée.

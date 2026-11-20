@@ -1,0 +1,19 @@
+#!/bin/sh
+# .githooks/pre-commit : lance les hooks de .pre-commit-config.yaml avant chaque commit.
+#
+# Pourquoi ce relais ? Le bloc git-collab active ses hooks avec
+# `git config core.hooksPath .githooks` ; `pre-commit install` refuse de s'installer
+# dans ce cas. Ce script garde .githooks/ comme point d'entrée unique et délègue
+# à pre-commit (gitleaks, clé privée, gros fichiers…).
+# Garder le bit exécutable : chmod +x puis git add --chmod=+x .githooks/pre-commit
+
+# pre-commit absent du poste : on prévient sans bloquer (le job `secrets` de la CI
+# rattrapera), plutôt que d'empêcher tout commit à quelqu'un qui n'a pas l'outil.
+if ! command -v pre-commit >/dev/null 2>&1; then
+  echo "pre-commit non installé : hooks de sécurité ignorés (pipx install pre-commit)." >&2
+  exit 0
+fi
+
+# Sans argument, `pre-commit run` ne vérifie que les fichiers indexés (git add).
+# Son code de sortie (1 si un hook échoue) refuse le commit.
+exec pre-commit run --hook-stage pre-commit

@@ -1,0 +1,55 @@
+# =============================================================================
+# .pre-commit-config.yaml : vérifications lancées sur le poste AVANT chaque commit
+#
+#   pipx install pre-commit      (ou : pip install --user pre-commit)
+#   pre-commit run --all-files   (à la demande, sur tout le dépôt)
+#
+# Activation : voir le commentaire « Activation » plus bas (deux cas, selon que
+# le bloc git-collab a posé .githooks/ ou non).
+#
+# Le hook gitleaks bloque le commit si un secret est dans les fichiers indexés :
+# un secret jamais commité n'a pas à être révoqué ni purgé de l'historique.
+# Un hook se contourne (git commit --no-verify) ou s'oublie : le job `secrets`
+# de security.yml reste le vrai contrôle.
+# Mettre à jour les versions : pre-commit autoupdate (puis relire le diff).
+# =============================================================================
+
+repos:
+  # Secrets : gitleaks sur les fichiers indexés (lit .gitleaks.toml à la racine).
+  # Le hook « gitleaks » compile l'outil en Go au premier lancement (pre-commit
+  # télécharge Go s'il manque : ~1 min, une seule fois). Variante sans Go mais
+  # avec Docker : id « gitleaks-docker ».
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  # Hooks de base, sans dépendance (Python pur).
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: detect-private-key # bloque -----BEGIN ... PRIVATE KEY----- (doublon utile de gitleaks)
+      - id: check-added-large-files # refuse un fichier > 500 ko (dump, binaire, archive oubliée)
+      - id: check-merge-conflict # refuse les marqueurs <<<<<<< oubliés
+      - id: check-yaml # YAML valide (workflows, compose) ; --unsafe : ne vérifie que la syntaxe
+        args: [--unsafe]
+
+# --- Activation ----------------------------------------------------------------
+# Cas 1 (par défaut) : le bloc git-collab a posé .githooks/ et `core.hooksPath=.githooks`.
+#   `pre-commit install` refuse alors de s'installer (« Cowardly refusing… core.hooksPath »).
+#   On ne touche pas à core.hooksPath : .githooks/pre-commit appelle pre-commit
+#   (template githooks-pre-commit du bloc devsecops). Rien d'autre à faire.
+#
+# Cas 2 : pas de .githooks/, ou l'équipe préfère que pre-commit gère TOUS les hooks.
+#   Décommenter le bloc ci-dessous (le hook commit-msg de git-collab passe dans
+#   pre-commit), puis : git config --unset core.hooksPath && pre-commit install
+#   et remplacer le script npm `prepare` de git-collab par `pre-commit install || true`.
+#
+# default_install_hook_types: [pre-commit, commit-msg]
+#   - repo: local
+#     hooks:
+#       - id: conventional-commit
+#         name: Conventional Commits
+#         entry: .githooks/commit-msg
+#         language: script
+#         stages: [commit-msg]
