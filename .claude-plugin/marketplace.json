@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "devops-kit",
+  "description": "Marketplace locale du plugin devops-kit : des blocs DevOps à appliquer à mes projets perso.",
+  "owner": { "name": "Ylian Merrir" },
+  "plugins": [
+    {
+      "name": "devops-kit",
+      "source": "./plugins/devops-kit",
+      "description": "Analyse un projet, propose les process DevOps pertinents (Git collaboratif, CI, Docker, CD, IaC, monitoring, DevSecOps) et applique ceux qu'on choisit.",
+      "category": "devops"
+    }
+  ]
+}
