@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Hook Git « commit-msg » : refuse un message qui ne suit pas Conventional Commits.
+#
+# Git appelle ce script juste après la saisie du message, avec UN argument :
+# le chemin du fichier qui contient le message. Code de sortie 0 = commit
+# accepté, autre chose = commit annulé (le message est conservé dans
+# .git/COMMIT_EDITMSG, on peut le reprendre avec `git commit -e -F .git/COMMIT_EDITMSG`).
+#
+# Activation, une fois par clone :   git config core.hooksPath .githooks
+#
+# Ce hook est un CONFORT local (contournable avec --no-verify). La garantie
+# réelle est côté serveur : fusion en squash avec le titre de la PR comme
+# message, titre relu en revue.
+# -----------------------------------------------------------------------------
+set -euo pipefail   # -e : arrêt à la 1re erreur ; -u : variable inconnue = erreur ; pipefail : une erreur dans un pipe compte
+
+fichier="$1"        # le fichier du message, fourni par Git
+
+# Première ligne utile du message : on retire les lignes de commentaire (#) que Git ajoute.
+entete="$(grep -v '^#' "$fichier" | head -n 1)"
+
+# Messages générés par Git lui-même : on les laisse passer.
+#   Merge …      : commit de fusion (git merge, git pull)
+#   Revert "…"   : git revert
+#   fixup!/squash!/amend! : préparés pour un `git rebase -i --autosquash`
+if [[ "$entete" =~ ^(Merge\ |Revert\ \"|fixup!\ |squash!\ |amend!\ ) ]]; then
+  exit 0
+fi
+
+# Les types autorisés (les plus courants de la convention).
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+
+# Format attendu :  type(portée facultative)!facultatif: description
+#   ^(types)                le type, en minuscules
+#   (\([a-z0-9._/-]+\))?    une portée facultative entre parenthèses, ex. (api)
+#   !?                      un « ! » facultatif = changement cassant
+#   :\ [^ ]                 deux-points, UNE espace, puis la description (pas vide)
+motif="^(${types})(\([a-z0-9._/-]+\))?!?: [^ ]"
+
+erreur=""
+if [[ ! "$entete" =~ $motif ]]; then
+  erreur="le format n'est pas « type(portée): description »"
+elif (( ${#entete} > 72 )); then              # ${#var} = longueur de la chaîne
+  erreur="la première ligne fait ${#entete} caractères (72 maximum)"
+elif [[ "$entete" =~ \.$ ]]; then
+  erreur="la description se termine par un point"
+fi
+
+if [[ -z "$erreur" ]]; then
+  exit 0             # tout va bien : Git crée le commit
+fi
+
+# Message d'aide sur la sortie d'erreur (>&2), puis refus (exit 1).
+cat >&2 <<AIDE
+✖ Commit refusé : ${erreur}.
+  Reçu    : ${entete}
+  Attendu : <type>(<portée facultative>): <description à l'impératif, sans point final>
+  Types   : ${types//|/, }
+  Exemple : feat(api): ajoute la pagination des tâches
+AIDE
+exit 1

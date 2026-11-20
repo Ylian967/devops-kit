@@ -1,0 +1,30 @@
+# -----------------------------------------------------------------------------
+# CODEOWNERS : qui doit relire quoi.
+#
+# GitHub ajoute automatiquement ces personnes comme relecteurs d'une PR qui
+# touche leurs fichiers. Avec la règle « Require review from Code Owners » du
+# ruleset, leur approbation devient obligatoire pour fusionner.
+#
+# Règles de lecture :
+#   - un motif par ligne, suivi d'un ou plusieurs @utilisateur ou @org/équipe ;
+#   - syntaxe proche de .gitignore (/ en tête = racine du dépôt, ** = n'importe quel sous-dossier) ;
+#   - c'est la DERNIÈRE ligne qui correspond qui l'emporte : du général au particulier ;
+#   - un propriétaire doit avoir un accès en écriture au dépôt, sinon GitHub l'ignore.
+#
+# En équipe : au moins DEUX propriétaires par chemin, sinon le seul propriétaire
+# ne pourra jamais fusionner ses propres changements (on ne s'approuve pas soi-même).
+# En solo : le fichier documente qui est responsable ; la règle Code Owners du ruleset reste désactivée.
+# -----------------------------------------------------------------------------
+
+# Par défaut, tout le dépôt.
+*                    @PROPRIETAIRE_PRINCIPAL @SECOND_RELECTEUR
+
+# L'outillage du dépôt (CI/CD, ce fichier, règles de contribution) mérite une
+# relecture par la personne la plus à l'aise avec le DevOps.
+/.github/            @PROPRIETAIRE_PRINCIPAL @SECOND_RELECTEUR
+/.githooks/          @PROPRIETAIRE_PRINCIPAL @SECOND_RELECTEUR
+/CONTRIBUTING.md     @PROPRIETAIRE_PRINCIPAL @SECOND_RELECTEUR
+
+# Lignes ajoutées selon la stack (voir references/stacks.md), par exemple :
+# **/Dockerfile      @PROPRIETAIRE_PRINCIPAL @SECOND_RELECTEUR
+# compose*.yaml      @PROPRIETAIRE_PRINCIPAL @SECOND_RELECTEUR
