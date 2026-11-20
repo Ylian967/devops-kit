@@ -1,0 +1,219 @@
+# =============================================================================
+# iac.yml : l'infrastructure (infra/) passe en revue comme du code.
+# Cible « runner self-hosted local » (variante VPS : references/cibles.md).
+#
+#   PR qui touche infra/ ─▶ fmt ──┐
+#                         validate ┴─▶ plan ─▶ comment
+#   fmt, validate : ubuntu-latest, sans state ni Docker (contrôles statiques) ;
+#   plan          : runner [self-hosted, deploy], contre le VRAI state du staging ;
+#   comment       : publie le plan dans la PR (un seul commentaire, mis à jour).
+#
+# L'apply n'est PAS ici : release.yml (job deploy-staging) l'applique après le
+# merge sur main, avec l'image qui vient d'être construite.
+#
+# Pourquoi le plan tourne sur le runner self-hosted :
+#   sur ubuntu-latest, le daemon Docker est vide et le state absent : le plan
+#   dirait « 7 to add » à chaque PR, ce qui n'apprend rien au relecteur. Le
+#   runner de la machine voit le staging réel et son state ($DEPLOY_DIR) : le
+#   plan montre la différence exacte que l'apply produira.
+# Le prix : du code de PR s'exécute sur une machine qui a le socket Docker
+# (= root). D'où : jamais de PR venant d'un fork (condition `if` du job), le
+# réglage « Require approval for all external contributors » (Settings →
+# Actions → General) qui empêche une PR de fork de modifier ce fichier pour
+# retirer la condition, et aucun secret dans le job.
+#
+# Prérequis : runner avec le label `deploy` (bloc cd-release), environment
+# `staging` avec la variable DEPLOY_DIR (là où vit terraform.tfstate),
+# .terraform.lock.hcl commité.
+# =============================================================================
+
+name: IaC
+
+on:
+  # Filtre de chemins : une PR qui ne touche pas l'infrastructure ne lance rien.
+  # Conséquence : ces jobs NE DOIVENT PAS être des checks requis du ruleset ;
+  # une PR sans changement dans infra/ attendrait un check qui ne vient jamais
+  # (« Expected — Waiting for status to be reported ») et serait bloquée.
+  # Le plan reste visible dans la PR, c'est le relecteur qui décide.
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/iac.yml"
+  # À la main (Actions → IaC → Run workflow) : détection de dérive, le job plan
+  # échoue si le staging ne correspond plus au code de la branche.
+  workflow_dispatch:
+
+# Aucun droit par défaut : chaque job déclare le strict nécessaire.
+permissions: {}
+
+# Un nouveau push sur la PR annule le plan précédent (un plan ne modifie rien).
+concurrency:
+  group: iac-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TOFU_VERSION: "1.13.9" # même version qu'en local : `tofu version`
+  TF_IN_AUTOMATION: "1" # messages adaptés à un pipeline
+  TF_INPUT: "0" # jamais de question interactive : une variable manquante = erreur
+
+jobs:
+  # ---------- fmt : formatage canonique ---------------------------------------
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      # Actions épinglées par SHA de commit (un tag peut être déplacé, pas un SHA) ;
+      # la version est en commentaire et Dependabot les met à jour.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false # sortie et code retour bruts de tofu (sinon enveloppés par l'action)
+      # -diff : la correction attendue est dans le log ; en local : `tofu fmt -recursive`
+      - run: tofu fmt -check -recursive -diff
+
+  # ---------- validate : syntaxe et types, sans state ------------------------
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      # -backend=false : pas de state ici ; -lockfile=readonly : échoue si
+      # .terraform.lock.hcl manque ou n'est plus à jour (il doit être commité).
+      - run: tofu init -backend=false -lockfile=readonly
+      - run: tofu validate
+
+  # ---------- plan : contre le staging réel ----------------------------------
+  plan:
+    name: plan
+    needs: [fmt, validate]
+    # Jamais pour une PR venant d'un fork (voir l'en-tête).
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, deploy]
+    timeout-minutes: 10
+    # Lit la variable DEPLOY_DIR de l'environment staging ; deployment: false =
+    # aucun « déploiement » n'est inscrit dans la PR (un plan ne déploie rien).
+    environment:
+      name: staging
+      deployment: false
+    permissions:
+      contents: read # GITHUB_TOKEN en lecture seule : le code de la PR ne peut rien écrire
+    outputs:
+      markdown: ${{ steps.plan.outputs.markdown }} # repris par le job comment
+    defaults:
+      run:
+        working-directory: infra
+    env:
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      # Le state vit dans le dossier du staging, hors du dépôt (il contient le
+      # mot de passe de la base). Même chemin que pour release.yml.
+      - name: tofu init (state dans DEPLOY_DIR)
+        run: |
+          [ -n "$DEPLOY_DIR" ] || { echo "::error::Variable DEPLOY_DIR absente de l'environment staging"; exit 1; }
+          tofu init -lockfile=readonly -backend-config="path=$DEPLOY_DIR/terraform.tfstate"
+      - name: tofu plan
+        id: plan
+        run: |
+          # On garde la version DÉJÀ en ligne (lue dans le state) : le plan ne
+          # montre que l'effet du changement d'infrastructure proposé par la PR.
+          # Avant la migration (state vide) : la version déployée par Compose.
+          # (state vide : `tofu output` affiche un avertissement et réussit, d'où le grep)
+          tag="$(tofu output -no-color -raw image_tag 2>/dev/null | grep -xE '[0-9a-f]{7}' || true)"
+          [ -n "$tag" ] || tag="$(cat "$DEPLOY_DIR/.deployed-tag" 2>/dev/null || true)"
+          [[ "$tag" =~ ^[0-9a-f]{7}$ ]] || { echo "::error::Version en ligne introuvable (state vide et pas de .deployed-tag)"; exit 1; }
+          # -detailed-exitcode : 0 = rien à faire, 2 = changements, 1 = erreur.
+          # -lock-timeout : attend si un déploiement tient le verrou du state.
+          # Pas de -out : ce plan n'est jamais appliqué, et un fichier de plan
+          # contiendrait les valeurs sensibles en clair.
+          set +e
+          tofu plan -no-color -lock-timeout=120s -detailed-exitcode -var "image_tag=$tag" > plan.txt 2>&1
+          code=$?
+          set -e
+          cat plan.txt
+          summary="$(grep -E '^(Plan:|No changes\.|Error:)' plan.txt | head -n 1 || true)"
+          {
+            echo "### Plan OpenTofu : staging"
+            echo
+            echo "**${summary:-voir le log du job}** (image en ligne : \`$tag\`, commit \`${GITHUB_SHA::7}\`)"
+            echo
+            echo "<details><summary>Plan complet</summary>"
+            echo
+            echo '```'
+            head -c 60000 plan.txt # un commentaire GitHub est limité à 65 536 caractères
+            echo '```'
+            echo "</details>"
+          } > plan.md
+          cat plan.md >> "$GITHUB_STEP_SUMMARY"
+          # Sortie multiligne : délimiteur aléatoire, que le plan ne peut pas contenir
+          delim="PLAN_$(openssl rand -hex 8)"
+          { echo "markdown<<$delim"; cat plan.md; echo "$delim"; } >> "$GITHUB_OUTPUT"
+          rm -f plan.txt plan.md
+          if [ "$code" = 1 ]; then echo "::error::tofu plan a échoué"; exit 1; fi
+          if [ "$code" = 2 ] && [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "::error::Dérive : le staging ne correspond plus au code"; exit 1
+          fi
+
+  # ---------- comment : le plan dans la PR -----------------------------------
+  # Job séparé : seul lui a le droit d'écrire dans la PR, et il ne lance aucun
+  # code de la PR (il ne fait pas de checkout).
+  comment:
+    name: comment
+    needs: plan
+    # !cancelled() : publier aussi un plan en erreur (le relecteur voit pourquoi).
+    if: >-
+      !cancelled()
+      && github.event_name == 'pull_request'
+      && needs.plan.outputs.markdown != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      pull-requests: write # créer ou modifier le commentaire
+    steps:
+      # Un seul commentaire par PR, repéré par un marqueur invisible, mis à jour à
+      # chaque push plutôt que dupliqué.
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PLAN: ${{ needs.plan.outputs.markdown }} # par env : jamais interpolé dans le script
+        with:
+          script: |
+            const marker = '<!-- devops-kit:iac-plan -->';
+            const body = `${marker}\n${process.env.PLAN}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const previous = comments.find((c) => c.body && c.body.startsWith(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

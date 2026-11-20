@@ -1,0 +1,21 @@
+# =============================================================================
+# inventory.ini.example : les machines que site.yml prépare. Modèle VERSIONNÉ ;
+# la copie réelle (inventory.ini) est ignorée par Git (adresse du serveur).
+#
+#   cp ansible/inventory.ini.example ansible/inventory.ini
+#
+# UNE seule ligne à garder dans [serveurs], selon la cible du bloc cd-release.
+# =============================================================================
+
+[serveurs]
+# Cible « VPS en SSH » : connexion en root (ou un compte sudo) le temps de la
+# préparation ; ensuite seul l'utilisateur deploy sert, au pipeline.
+vps ansible_host=203.0.113.10 ansible_user=root
+
+# Cible « runner self-hosted local » : le poste lui-même, sans SSH.
+# (dans site.yml : preparer_systeme: false)
+# local ansible_connection=local
+
+[serveurs:vars]
+# Python de la machine, trouvé tout seul, sans avertissement
+ansible_python_interpreter=auto_silent

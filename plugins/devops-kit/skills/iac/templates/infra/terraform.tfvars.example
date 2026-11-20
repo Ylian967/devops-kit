@@ -1,0 +1,19 @@
+# =============================================================================
+# terraform.tfvars.example : modèle VERSIONNÉ, valeurs non secrètes.
+#
+#   cp terraform.tfvars.example terraform.tfvars   # terraform.tfvars est ignoré par Git
+#
+# Secrets (ghcr_token) : JAMAIS dans un .tfvars. Variables d'environnement à
+# la place, le temps de la commande (paquet ghcr.io privé seulement) :
+#   export TF_VAR_ghcr_username=<compte GitHub>
+#   export TF_VAR_ghcr_token=<PAT read:packages>
+# =============================================================================
+
+# Version à déployer : SHA court d'une image publiée par release.yml
+image_tag = "a1b2c3d"
+
+# Port sur la machine cible, s'il est déjà pris
+# published_port = 8081
+
+# Daemon Docker d'un VPS (sinon : socket local)
+# docker_host = "ssh://deploy@vps.example.com"

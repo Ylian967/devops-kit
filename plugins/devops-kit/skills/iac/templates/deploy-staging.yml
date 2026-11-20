@@ -1,0 +1,94 @@
+# =============================================================================
+# deploy-staging.yml : FRAGMENT, pas un workflow. Ce job REMPLACE le job
+# deploy-staging de .github/workflows/release.yml (bloc cd-release, cible
+# « runner self-hosted local » ; variante VPS : references/cibles.md).
+#
+# Le staging n'est plus lancé par deploy/deploy.sh (Compose) mais par OpenTofu
+# (infra/) : un seul outil par environnement. La production ne change pas.
+# Même nom, mêmes needs, if, environment et concurrency : rien d'autre dans
+# release.yml n'a besoin de bouger, SAUF les ancres YAML : release.yml les
+# définit (&check, &checkout, &copy, &login, &deploy, &logout) dans les steps
+# de l'ancien deploy-staging. Avant de remplacer ce job, recopier ces steps en
+# entier dans deploy-production à la place des alias (*check…), SANS les
+# marques &… (actionlint refuse une ancre définie mais jamais utilisée).
+#
+# Retour arrière : comme avant, Actions → Release → Run workflow avec un tag ;
+# et automatique si l'apply échoue (dernier step).
+# =============================================================================
+
+  # ---------- deploy-staging : OpenTofu (bloc iac) --------------------------
+  deploy-staging:
+    name: deploy-staging
+    needs: [prepare, scan]
+    # !cancelled() : tourner aussi quand scan a été SAUTÉ (rollback sans build).
+    if: >-
+      !cancelled()
+      && needs.prepare.outputs.staging == 'true'
+      && (needs.scan.result == 'success' || needs.scan.result == 'skipped')
+    runs-on: [self-hosted, deploy]
+    timeout-minutes: 15
+    environment:
+      name: staging
+      url: ${{ vars.APP_URL }} # ex. http://127.0.0.1:8081 (outputs.tf : health_url)
+    # Un déploiement à la fois, jamais interrompu à mi-chemin : un apply coupé
+    # laisse des conteneurs à moitié remplacés.
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read # lire infra/
+      packages: read # le provider docker tire l'image de ghcr.io
+    defaults:
+      run:
+        working-directory: infra
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }} # validé par prepare : 7 caractères hexadécimaux
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }} # contient terraform.tfstate
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0" # une variable manquante = erreur, jamais une question
+      # Authentification du provider à ghcr.io (providers.tf). Le jeton du run
+      # expire à la fin du job et n'est pas écrit dans le state.
+      TF_VAR_ghcr_username: ${{ github.actor }}
+      TF_VAR_ghcr_token: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # Actions épinglées par SHA de commit, version en commentaire.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: "1.13.9" # la même que dans iac.yml
+          tofu_wrapper: false
+      - name: tofu init (state dans DEPLOY_DIR)
+        run: |
+          [ -n "$DEPLOY_DIR" ] || { echo "::error::Variable DEPLOY_DIR absente de l'environment staging"; exit 1; }
+          tofu init -lockfile=readonly -backend-config="path=$DEPLOY_DIR/terraform.tfstate"
+      # La version en ligne AVANT le changement : la cible du retour arrière.
+      - name: Version en ligne
+        id: current
+        run: |
+          tag="$(tofu output -no-color -raw image_tag 2>/dev/null | grep -xE '[0-9a-f]{7}' || true)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      # On applique LE plan affiché dans le log (fichier tfplan), pas un nouveau
+      # calcul. Les conteneurs ont `wait = true` (main.tf) : l'apply échoue si
+      # l'application n'est pas « healthy » à temps. Ce healthcheck interroge
+      # /health dans le conteneur qui porte APP_VERSION=$TAG : il tient lieu de
+      # smoke test (ce staging n'a pas de proxy HTTPS devant lui).
+      - name: tofu plan puis apply (${{ env.TAG }})
+        run: |
+          tofu plan -lock-timeout=120s -var "image_tag=$TAG" -out=tfplan
+          tofu apply -lock-timeout=120s tfplan
+      # Comme deploy.sh : on revient à la version précédente, et le job reste
+      # rouge (un incident a eu lieu, même si le staging est rétabli).
+      - name: Retour automatique à la version précédente
+        if: failure() && steps.current.outputs.tag != '' && steps.current.outputs.tag != env.TAG
+        env:
+          PREVIOUS: ${{ steps.current.outputs.tag }}
+        run: |
+          echo "::error::Échec du déploiement de $TAG : retour à $PREVIOUS"
+          tofu apply -auto-approve -lock-timeout=120s -var "image_tag=$PREVIOUS"
+      # Un fichier de plan contient les valeurs des variables EN CLAIR (dont le
+      # jeton ghcr.io) : il ne reste pas sur le runner persistant.
+      - name: Nettoyer
+        if: always()
+        run: rm -f tfplan

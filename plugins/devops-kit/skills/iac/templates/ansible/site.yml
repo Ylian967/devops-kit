@@ -1,0 +1,157 @@
+# =============================================================================
+# site.yml : prépare la machine qui héberge staging et production, de façon
+# IDEMPOTENTE (rejouable : un deuxième passage doit finir avec changed=0).
+#
+#   cd ansible
+#   ansible-playbook -i inventory.ini site.yml --check --diff   # simulation
+#   ansible-playbook -i inventory.ini site.yml
+#   ansible-playbook -i inventory.ini site.yml                  # 2e passage : changed=0
+#
+# Ce qu'il fait (les gestes manuels de cd-release, en code) :
+#   - preparer_systeme: true (VPS) : Docker, utilisateur deploy dans le groupe
+#     docker, sa clé SSH publique de déploiement ;
+#   - les dossiers de chaque environnement (DEPLOY_DIR) avec les bons droits ;
+#   - le .env des environnements Compose, rendu depuis templates/env.j2 avec un
+#     mot de passe tiré au hasard, UNE SEULE FOIS : un .env existant n'est
+#     jamais réécrit (il contient le mot de passe qui a initialisé la base).
+# Ce qu'il ne fait PAS : déployer (c'est release.yml), durcir SSH ni le pare-feu
+# (une erreur vous enferme dehors : geste manuel, docs/DEPLOIEMENT.md).
+#
+# Modèle à ADAPTER : les valeurs de `vars` ci-dessous (projet, image, dossiers,
+# ports). Une valeur ponctuelle se surcharge par -e, ex. -e preparer_systeme=false.
+# =============================================================================
+
+- name: Préparer la machine de déploiement
+  hosts: serveurs
+  # root seulement pour installer Docker et créer l'utilisateur (VPS) ; en
+  # local, tout se passe dans le dossier de l'utilisateur, sans sudo.
+  become: "{{ preparer_systeme | bool }}"
+  gather_facts: true # ansible_user_id, distribution (script Docker)
+
+  vars:
+    projet: monapp # REMPLACER : nom du dépôt en minuscules (<projet>-<env>)
+    image_name: ghcr.io/proprietaire/monapp # REMPLACER : ghcr.io/<owner>/<repo> en minuscules
+    preparer_systeme: true # false : poste local (cible runner), Docker déjà là
+    # Propriétaire des dossiers : l'utilisateur de déploiement sur un VPS, vous en local.
+    deploy_user: "{{ 'deploy' if preparer_systeme | bool else ansible_user_id }}"
+    # Clé PUBLIQUE de déploiement (contenu de deploy_key.pub), jamais la privée.
+    # Laisser vide en local. Ex. : -e "deploy_pubkey='$(cat deploy_key.pub)'"
+    deploy_pubkey: ""
+    # Un dossier par environnement (convention DEPLOY_DIR : /opt/<repo>/<env> sur
+    # un VPS, ~/deploy/<repo>-<env> en local). compose: true = l'environnement
+    # tourne en Compose (deploy.sh) et a besoin d'un .env ; le staging, géré par
+    # OpenTofu, n'y garde que terraform.tfstate.
+    environnements:
+      staging:
+        dir: /opt/monapp/staging
+        compose: false
+      production:
+        dir: /opt/monapp/production
+        compose: true
+        http_port: 80
+        https_port: 443
+        # Runner local (deploy.sh tourne dans le conteneur du runner) :
+        # smoke_url: https://host.docker.internal:443/health
+        # VPS avec Let's Encrypt : smoke_url: https://app.example.com/health, smoke_curl_opts: ""
+
+  pre_tasks:
+    - name: Vérifier les variables
+      ansible.builtin.assert:
+        that:
+          - projet is match('^[a-z0-9][a-z0-9-]*$')
+          - image_name == image_name | lower # ghcr.io refuse les majuscules
+          - not (preparer_systeme | bool) or deploy_pubkey is match('^ssh-')
+        fail_msg: "projet et image_name en minuscules ; deploy_pubkey (ssh-ed25519 …) obligatoire sur un VPS"
+        quiet: true
+
+  tasks:
+    # ---------- Système (VPS seulement) -------------------------------------
+    - name: Docker et utilisateur deploy
+      when: preparer_systeme | bool
+      block:
+        - name: Docker est-il déjà installé ?
+          ansible.builtin.stat:
+            path: /usr/bin/docker
+          register: docker_bin
+
+        # Script officiel : Docker Engine + plugin compose, depuis le dépôt de
+        # Docker (les paquets de la distribution sont souvent anciens).
+        - name: Installer Docker (script officiel, une seule fois)
+          when: not docker_bin.stat.exists
+          block:
+            - name: Télécharger get.docker.com
+              ansible.builtin.get_url:
+                url: https://get.docker.com
+                dest: /root/get-docker.sh
+                mode: "0700"
+            - name: Lancer le script d'installation
+              ansible.builtin.command: sh /root/get-docker.sh
+              changed_when: true
+
+        - name: Démarrer Docker au boot
+          ansible.builtin.service:
+            name: docker
+            state: started
+            enabled: true
+
+        # Membre du groupe docker = équivalent root sur la machine : un
+        # utilisateur DÉDIÉ, sans mot de passe, joignable par clé seulement.
+        - name: Créer l'utilisateur deploy
+          ansible.builtin.user:
+            name: "{{ deploy_user }}"
+            groups: docker
+            append: true # garde ses autres groupes
+            shell: /bin/bash
+            password: "!" # compte verrouillé : aucune connexion par mot de passe
+
+        - name: Dossier .ssh de deploy
+          ansible.builtin.file:
+            path: "/home/{{ deploy_user }}/.ssh"
+            state: directory
+            owner: "{{ deploy_user }}"
+            group: "{{ deploy_user }}"
+            mode: "0700"
+
+        # Le fichier ENTIER est remplacé : seule la clé de déploiement entre.
+        - name: Autoriser la clé de déploiement
+          ansible.builtin.copy:
+            content: "{{ deploy_pubkey | trim }}\n"
+            dest: "/home/{{ deploy_user }}/.ssh/authorized_keys"
+            owner: "{{ deploy_user }}"
+            group: "{{ deploy_user }}"
+            mode: "0600"
+
+    # ---------- Dossiers des environnements --------------------------------
+    - name: Créer DEPLOY_DIR de chaque environnement
+      ansible.builtin.file:
+        path: "{{ item.value.dir }}"
+        state: directory
+        owner: "{{ deploy_user }}"
+        mode: "0750" # ni lisible ni modifiable par les autres comptes
+      loop: "{{ environnements | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}" # le log affiche le nom, pas tout le dictionnaire
+
+    - name: Sous-dossiers des environnements Compose (certificats, sauvegardes)
+      ansible.builtin.file:
+        path: "{{ item.0.value.dir }}/{{ item.1 }}"
+        state: directory
+        owner: "{{ deploy_user }}"
+        mode: "0700" # clé privée TLS et dumps de la base : propriétaire seul
+      loop: "{{ environnements | dict2items | selectattr('value.compose') | product(['certs', 'backups']) | list }}"
+      loop_control:
+        label: "{{ item.0.key }}/{{ item.1 }}"
+
+    # force: false : créé s'il manque, JAMAIS réécrit. Le mot de passe d'un
+    # volume PostgreSQL déjà initialisé ne doit pas changer (base inaccessible).
+    - name: Rendre le .env des environnements Compose (une seule fois, 0600)
+      ansible.builtin.template:
+        src: env.j2
+        dest: "{{ item.value.dir }}/.env"
+        owner: "{{ deploy_user }}"
+        mode: "0600" # secrets : lisible par le seul propriétaire
+        force: false
+      loop: "{{ environnements | dict2items | selectattr('value.compose') | list }}"
+      loop_control:
+        label: "{{ item.key }}"
+      no_log: true # le --diff afficherait le mot de passe
