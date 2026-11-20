@@ -1,0 +1,147 @@
+# =============================================================================
+# ci.yml : intégration continue (Java / Maven)
+#
+# Mêmes principes que pour toutes les stacks : PR et push sur main, droits en
+# lecture seule, un run par PR, et des `name:` de jobs STABLES (ce sont les
+# checks requis du ruleset de main) :
+#   lint          formatage + analyse statique (Spotless, Checkstyle…)  requis
+#   test          tests unitaires (Surefire) + seuil JaCoCo               requis
+#   integration   tests *IT (Failsafe) contre PostgreSQL                  requis si base
+#   build         le jar/war se construit                                 requis
+#   docker-build  l'image Docker se construit                             non requis
+# Le wrapper ./mvnw est utilisé s'il existe (version de Maven figée dans le dépôt).
+# =============================================================================
+
+name: CI
+
+on:
+  pull_request: # toujours, sans filtre : les checks requis doivent tourner
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+
+permissions:
+  contents: read # moindre privilège
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # jamais d'annulation sur main
+
+env:
+  JAVA_VERSION: "21" # = <maven.compiler.release> du pom.xml
+  # Lu automatiquement par Maven ≥ 3.9 à chaque commande.
+  # -B : mode batch (pas de couleurs ni de questions) ; -ntp : pas de barre de progression des téléchargements
+  MAVEN_ARGS: -B -ntp
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Installe le JDK Temurin et met en cache ~/.m2/repository (clé = hash des pom.xml)
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      # Adapter au plugin présent dans le pom (voir references/java.md) :
+      # spotless:check, checkstyle:check, ou les deux.
+      - name: Formatage et analyse statique
+        run: ./mvnw spotless:check checkstyle:check
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      # `verify` lance Surefire (tests unitaires) puis jacoco:check, qui échoue
+      # sous le seuil défini dans le pom. -DskipITs : les tests d'intégration
+      # (Failsafe) tournent dans leur propre job.
+      - name: Tests unitaires + couverture (JaCoCo)
+        run: ./mvnw verify -DskipITs
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # À supprimer si le projet n'a pas de base. Avec Testcontainers, supprimer
+    # seulement `services:` et `env:` : Docker est déjà disponible sur la VM.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app # base jetable : pas un secret
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h localhost -U app -d app"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # Spring Boot lit ces variables à la place de spring.datasource.* (relaxed binding)
+      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/app
+      SPRING_DATASOURCE_USERNAME: app
+      SPRING_DATASOURCE_PASSWORD: app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      # -DskipUTs : propriété définie dans le pom pour sauter Surefire
+      # (voir references/java.md) ; seuls les *IT.java tournent ici.
+      - name: Tests d'intégration (Failsafe + PostgreSQL)
+        run: ./mvnw verify -DskipUTs -Djacoco.skip=true
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+      # Les tests ont leurs jobs : ici on vérifie seulement que l'artefact se construit
+      - name: Package
+        run: ./mvnw package -DskipTests
+
+  # À supprimer s'il n'y a pas de Dockerfile (le bloc docker-dev l'ajoutera).
+  docker-build:
+    name: docker-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false # publier = bloc cd-release
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

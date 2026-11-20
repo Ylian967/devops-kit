@@ -1,0 +1,179 @@
+# =============================================================================
+# ci.yml : intégration continue (Node / Next.js)
+#
+# À chaque Pull Request et à chaque push sur main, une machine neuve vérifie que
+# le code est propre (lint, formatage), qu'il marche (tests unitaires, tests
+# d'intégration contre une vraie base), qu'il est assez testé (seuil de
+# couverture) et qu'il se construit (build, image Docker).
+#
+# Les `name:` des jobs sont STABLES : ce sont les noms des checks requis par le
+# ruleset de main. En renommer un bloque toutes les PR (« Expected — Waiting for
+# status to be reported ») tant que le ruleset n'est pas mis à jour.
+#   lint          ESLint + Prettier                         requis
+#   test          tests unitaires + seuil de couverture      requis
+#   integration   tests contre PostgreSQL (service)          requis si le projet a une base
+#   build         build de production (next build, vite…)    requis si le projet se construit
+#   docker-build  l'image Docker se construit                non requis
+# =============================================================================
+
+name: CI
+
+on:
+  # Sur les PR : TOUJOURS, sans filtre de chemins. Avec un filtre `paths`, une PR
+  # qui ne touche que la doc ne lancerait pas les checks requis : bloquée à vie.
+  pull_request:
+  # Sur main : inutile de tout revérifier pour un commit de documentation.
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+# Moindre privilège : le jeton GITHUB_TOKEN de ce workflow ne peut que LIRE le dépôt.
+permissions:
+  contents: read
+
+# Un seul run à la fois par PR : un nouveau push annule le run devenu inutile.
+# Sur main, on n'annule jamais : chaque commit de main doit avoir son verdict.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Version de Node, définie UNE fois. Si le projet a un .nvmrc, le remplacer par
+  # `node-version-file: .nvmrc` dans chaque setup-node et supprimer cette ligne.
+  NODE_VERSION: "22"
+
+jobs:
+  # ---------- lint : le code est-il propre ? ----------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # garde-fou : un job bloqué ne consomme pas 6 h de minutes
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false # le jeton n'est pas laissé dans .git/config pour les steps suivants
+
+      # Installe Node et met en cache ~/.npm (clé = hash du lockfile)
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm # pnpm / yarn : adapter (voir references/node.md)
+
+      # Installation EXACTE d'après le lockfile ; échoue s'il est désynchronisé de package.json
+      - run: npm ci
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Formatage (Prettier)
+        run: npm run format:check
+
+  # ---------- test : tests unitaires + seuil de couverture --------------------
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      # Le seuil vit dans la configuration du projet (script test:coverage,
+      # vitest.config, jest.config) : le même seuil s'applique en local et ici.
+      # Sous le seuil, la commande sort en erreur et le job devient rouge.
+      - name: Tests unitaires + couverture
+        run: npm run test:coverage
+
+  # ---------- integration : contre une vraie base de données ------------------
+  # À supprimer si le projet n'a pas de base (ou une base hébergée comme Convex).
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # « Service container » : GitHub démarre PostgreSQL à côté du job, et attend
+    # qu'il soit EN BONNE SANTÉ (pas seulement démarré) avant les steps.
+    services:
+      postgres:
+        image: postgres:17-alpine # même version majeure qu'en dev et en prod
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app # base jetable détruite avec le job : pas un secret
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432 # les steps tournent SUR la VM : ils joignent localhost:5432
+        options: >-
+          --health-cmd "pg_isready -h localhost -U app -d app"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # Visible de tous les steps du job ; les tests d'intégration s'en servent
+      DATABASE_URL: postgres://app:app@localhost:5432/app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Tests d'intégration (PostgreSQL)
+        run: npm run test:int
+
+  # ---------- build : le projet se construit-il ? -----------------------------
+  # À supprimer si package.json n'a pas de script build (API lancée telle quelle).
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      # Next.js uniquement : réutilise le cache de compilation d'un run à l'autre.
+      # La clé change avec le lockfile et le code ; restore-keys reprend le cache le plus proche.
+      - uses: actions/cache@v6
+        with:
+          path: .next/cache
+          key: next-${{ hashFiles('package-lock.json') }}-${{ hashFiles('**/*.[jt]s', '**/*.[jt]sx') }}
+          restore-keys: next-${{ hashFiles('package-lock.json') }}-
+
+      - name: Build de production
+        run: npm run build
+
+  # ---------- docker-build : l'image se construit-elle ? ----------------------
+  # À supprimer s'il n'y a pas de Dockerfile (le bloc docker-dev l'ajoutera).
+  # Ni requis ni publié (push: false) : publier est le travail de release.yml
+  # (bloc cd-release). On attend lint et tests pour ne pas construire pour rien.
+  docker-build:
+    name: docker-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4 # BuildKit, nécessaire pour le cache type=gha
+
+      - name: Build de l'image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha # réutilise les couches du run précédent
+          cache-to: type=gha,mode=max # mode=max : met aussi en cache les étapes intermédiaires (multi-stage)

@@ -1,0 +1,176 @@
+# =============================================================================
+# ci.yml : intégration continue (Elixir / mix, Phoenix possible)
+#
+# Checks requis du ruleset (noms STABLES) :
+#   lint          mix format, compilation sans avertissement, credo        requis
+#   test          mix test --cover (seuil dans mix.exs)                    requis
+#   integration   mix test --only integration contre PostgreSQL            requis si base
+#   build         release de production (mix release)                      requis
+#   docker-build  l'image Docker se construit                              non requis
+#
+# Phoenix + Ecto : presque tous les tests passent par la base (sandbox Ecto).
+# Dans ce cas, garder la base dans le job `test` et supprimer le job
+# `integration` (voir references/elixir.md).
+# =============================================================================
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MIX_ENV: test # environnement mix par défaut des jobs (le job build le remplace)
+  # Versions définies UNE fois. Avec un .tool-versions (asdf/mise), utiliser plutôt
+  # `version-file: .tool-versions` et `version-type: strict` dans setup-beam.
+  OTP_VERSION: "27"
+  ELIXIR_VERSION: "1.18"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1 # installe Erlang/OTP et Elixir
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+      # Cache des dépendances et des fichiers compilés. La clé change avec
+      # mix.lock et les versions : un cache d'une autre version d'OTP casserait la compilation.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ env.MIX_ENV }}-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-${{ env.MIX_ENV }}-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-
+      - run: mix deps.get
+      - name: Formatage
+        run: mix format --check-formatted
+      - name: Compilation sans avertissement
+        run: mix compile --warnings-as-errors
+      # À supprimer si credo n'est pas dans les dépendances de mix.exs
+      - name: Credo
+        run: mix credo --strict
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ env.MIX_ENV }}-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-${{ env.MIX_ENV }}-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-
+      - run: mix deps.get
+      # --cover échoue sous test_coverage: [summary: [threshold: N]] de mix.exs.
+      # Les tests @tag :integration tournent dans leur propre job.
+      - name: Tests unitaires + couverture
+        run: mix test --cover --exclude integration
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app # base jetable : pas un secret
+          POSTGRES_DB: app_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h localhost -U app -d app_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # À lire dans config/test.exs (voir references/elixir.md)
+      DATABASE_URL: ecto://app:app@localhost:5432/app_test
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ env.MIX_ENV }}-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-${{ env.MIX_ENV }}-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-
+      - run: mix deps.get
+      - name: Tests d'intégration (PostgreSQL)
+        run: mix test --only integration
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MIX_ENV: prod # remplace la valeur du workflow pour ce job
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ env.MIX_ENV }}-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-${{ env.MIX_ENV }}-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-
+      - run: mix deps.get --only prod
+      # Phoenix avec assets : ajouter `mix assets.deploy` avant la release
+      - name: Release de production
+        run: mix release
+
+  # À supprimer s'il n'y a pas de Dockerfile.
+  docker-build:
+    name: docker-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
