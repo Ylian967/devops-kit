@@ -1,0 +1,99 @@
+# =============================================================================
+# compose.prod.yaml : staging ET production (un seul fichier, deux dossiers).
+#
+# Il est copié par le pipeline dans $DEPLOY_DIR, à côté de :
+#   .env      secrets et réglages de CET environnement (jamais versionné)
+#   deploy/   scripts et configuration Nginx (versionnés, copiés aussi)
+#   certs/    certificat HTTPS (jamais versionné)
+#   backups/  sauvegardes de la base (jamais versionnées)
+#
+# Différences avec compose.yaml (développement) :
+#   - pas de `build:` : on tire l'image construite, scannée et publiée par
+#     release.yml (build once, deploy many : staging et production font tourner
+#     EXACTEMENT la même image) ;
+#   - IMAGE_TAG (SHA court, fourni par deploy.sh) choisit la version ;
+#   - la configuration vient de .env (12-factor), le staging et la production ne
+#     diffèrent que par leurs valeurs : même structure, même proxy, même TLS ;
+#   - seul `proxy` publie des ports ; la base n'est jamais exposée.
+#
+# Le nom de projet (COMPOSE_PROJECT_NAME dans .env, ex. monapp-production)
+# préfixe conteneurs, volume et réseau (monapp-production_default) : deux
+# environnements cohabitent sur une machine sans se mélanger.
+#
+# Commandes à la main (dans $DEPLOY_DIR) : IMAGE_TAG est obligatoire, on reprend
+# la version en ligne :
+#   export IMAGE_TAG=$(cat .deployed-tag)
+#   docker compose -f compose.prod.yaml ps
+# =============================================================================
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER manquant dans .env}
+      # « :? » : erreur explicite si la variable manque, plutôt qu'un mot de passe vide
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD manquant dans .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB manquant dans .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data # les données survivent aux redéploiements
+    # Pas de `ports:` : seule l'application (même réseau) joint db:5432.
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'] # $$ : variable lue dans le conteneur
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    # ghcr.io/<owner>/<repo> en minuscules (IMAGE_NAME dans .env), tag = SHA court.
+    image: ${IMAGE_NAME:?IMAGE_NAME manquant dans .env}:${IMAGE_TAG:?IMAGE_TAG manquant, lancer deploy/deploy.sh}
+    environment:
+      PORT: "3000" # port interne de la stack (Java/Rust 8080, Phoenix 4000)
+      APP_ENV: ${APP_ENV:?APP_ENV manquant dans .env} # staging ou production
+      APP_VERSION: ${IMAGE_TAG} # renvoyée par /health : le smoke test la vérifie
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      # Autres variables de l'application : les ajouter ici, valeur dans .env :
+      # API_KEY: ${API_KEY:?API_KEY manquant dans .env}
+    depends_on:
+      db:
+        condition: service_healthy # attend que Postgres accepte les connexions
+    # Healthcheck Node (fetch intégré, aucun outil en plus dans l'image).
+    # Autres stacks : voir references/stacks.md du bloc cd-release.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s # temps de démarrage pendant lequel un échec ne compte pas
+    restart: unless-stopped
+
+  proxy:
+    image: nginx:1.29-alpine
+    # SEUL service qui publie des ports. Deux environnements sur la même machine
+    # (runner local) : ports différents dans chaque .env (ex. staging 8081/8444).
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./deploy/nginx/app.conf:/etc/nginx/conf.d/default.conf:ro # le site
+      - ./deploy/nginx:/etc/nginx/snippets:ro # security-headers.conf (bloc devsecops), s'il existe
+      - ./certs:/etc/nginx/certs:ro # fullchain.pem, privkey.pem
+      - ./certbot:/var/www/certbot:ro # défi Let's Encrypt (VPS), vide en local
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  pgdata:

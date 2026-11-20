@@ -1,0 +1,6 @@
+# .github/actionlint.yaml : configuration d'actionlint.
+# Les labels de runner inconnus de GitHub (runners self-hosted) sont déclarés ici,
+# sinon actionlint signale `runs-on: [self-hosted, deploy]` comme une faute de frappe.
+self-hosted-runner:
+  labels:
+    - deploy

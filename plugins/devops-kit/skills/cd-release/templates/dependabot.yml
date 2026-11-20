@@ -1,0 +1,61 @@
+# =============================================================================
+# .github/dependabot.yml : Dependabot ouvre des PR de mise à jour, la CI les vérifie.
+#
+# Une entrée par « écosystème » et par dossier. Les PR arrivent groupées une
+# fois par semaine (le lundi) : moins de bruit, et on les relit d'un coup.
+# Les mises à jour de SÉCURITÉ, elles, arrivent tout de suite (à activer dans
+# Settings → Code security → Dependabot security updates).
+#
+# Modèle à ADAPTER : garder les écosystèmes du projet, supprimer les autres.
+# =============================================================================
+version: 2
+
+updates:
+  # --- Dépendances de l'application (une seule de ces entrées, selon la stack) ---
+  - package-ecosystem: npm # Node / Next.js (npm, pnpm, yarn : même écosystème)
+    # maven | gradle | cargo | mix
+    directory: / # dossier du package.json (monorepo : une entrée par dossier)
+    schedule:
+      interval: weekly
+      day: monday
+    # Un groupe = une seule PR pour toutes les montées mineures et correctives :
+    # rarement cassantes, inutile d'en relire dix séparément. Les montées
+    # MAJEURES restent une PR chacune (changements cassants possibles).
+    groups:
+      mineures:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)" # titres Conventional Commits, acceptés par le hook
+
+  # --- Images de base des Dockerfile ------------------------------------------
+  - package-ecosystem: docker
+    directory: / # dossier du Dockerfile (un par composant en monorepo)
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "build(docker)"
+
+  # --- Images de compose.yaml / compose.prod.yaml (postgres, nginx…) ------------
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "build(docker)"
+
+  # --- Actions des workflows (.github/workflows) -------------------------------
+  # Met à jour les SHA épinglés ET leur commentaire de version. Avant de fusionner,
+  # lire les notes de version : un SHA de 40 caractères ne se relit pas à l'œil.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"

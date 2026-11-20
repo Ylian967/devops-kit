@@ -1,0 +1,254 @@
+# =============================================================================
+# release.yml : livraison continue, cible « runner self-hosted local »
+#
+#   push sur main
+#     prepare ─▶ build-push ─▶ scan ─▶ deploy-staging ─▶ (approbation) ─▶ deploy-production
+#               (ghcr.io:<sha>) (Trivy)  (automatique)                     (environment protégé)
+#
+# Build once, deploy many : une seule image par commit, taguée par le SHA court,
+# déployée telle quelle en staging puis en production. Rien n'est reconstruit.
+#
+# Les déploiements tournent sur un runner installé SUR la machine qui héberge
+# staging et production (votre poste ou un serveur à la maison) : il pilote son
+# Docker. Le build et le scan tournent chez GitHub (ubuntu-latest).
+#
+# Rollback : Actions → Release → Run workflow, `tag` = SHA court déjà publié,
+# `environment` = cible. Build et scan sont sautés. deploy.sh revient aussi
+# TOUT SEUL à la version précédente si le smoke test échoue.
+#
+# Prérequis (voir docs/DEPLOIEMENT.md) :
+#   - runner avec le label `deploy` (déclaré dans .github/actionlint.yaml) ;
+#   - environments GitHub `staging` et `production` (required reviewers), chacun
+#     avec la variable DEPLOY_DIR (chemin ABSOLU du dossier de l'environnement) ;
+#   - dans chaque DEPLOY_DIR : un .env rempli à la main, et certs/.
+# Aucun secret GitHub à créer : le GITHUB_TOKEN du run suffit pour ghcr.io.
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: # un commit de documentation ne livre rien
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Rollback : SHA court (7 caractères) d'une image déjà publiée. Vide = livrer main."
+        required: false
+        default: ""
+        type: string
+      environment:
+        description: "Rollback : environnement à redéployer (ignoré si tag est vide)"
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+
+# Aucun droit par défaut : chaque job déclare le strict nécessaire.
+permissions: {}
+
+jobs:
+  # ---------- prepare : décider QUOI faire, valider les entrées -------------
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      image: ${{ steps.plan.outputs.image }}
+      build: ${{ steps.plan.outputs.build }}
+      staging: ${{ steps.plan.outputs.staging }}
+      production: ${{ steps.plan.outputs.production }}
+    steps:
+      - id: plan
+        # Les entrées passent par `env:` : écrire ${{ inputs.tag }} directement
+        # dans le script permettrait d'y injecter des commandes shell.
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_ENV: ${{ inputs.environment }}
+        run: |
+          # ghcr.io exige un nom en minuscules ; ${VAR,,} = minuscules en bash
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          if [ -z "$INPUT_TAG" ]; then
+            # Livraison normale : seulement depuis main
+            [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::On ne livre que main ($GITHUB_REF)"; exit 1; }
+            tag="${GITHUB_SHA::7}"; build=true; staging=true; production=true
+          else
+            # Rollback : un SHA court, rien d'autre (il finit dans des commandes)
+            [[ "$INPUT_TAG" =~ ^[0-9a-f]{7}$ ]] || { echo "::error::tag attendu : 7 caractères hexadécimaux"; exit 1; }
+            tag="$INPUT_TAG"; build=false
+            staging=false; production=false
+            if [ "$INPUT_ENV" = production ]; then production=true; else staging=true; fi
+          fi
+          printf 'tag=%s\nbuild=%s\nstaging=%s\nproduction=%s\n' "$tag" "$build" "$staging" "$production" >> "$GITHUB_OUTPUT"
+          printf '### Plan\n| Tag | Build | Staging | Production |\n|---|---|---|---|\n| `%s` | %s | %s | %s |\n' \
+            "$tag" "$build" "$staging" "$production" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------- build-push : construire et publier l'image ---------------------
+  build-push:
+    name: build-push
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # lire le code
+      packages: write # publier sur ghcr.io
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      # Actions épinglées par SHA de commit (un tag peut être déplacé, pas un SHA) ;
+      # la version est en commentaire et Dependabot les met à jour.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # jeton du run, expire à la fin du job
+      - name: Construire et publier ${{ env.IMAGE }}:${{ env.TAG }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }} # SHA court seulement : jamais `latest` pour déployer
+          build-args: |
+            APP_VERSION=${{ env.TAG }}
+          # Relie le paquet ghcr.io au dépôt (droits d'accès hérités du dépôt)
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: 'echo "Publié : \`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"'
+
+  # ---------- scan : Trivy sur l'image publiée --------------------------------
+  # Publiée mais pas encore déployée : rien ne part en staging si le scan échoue.
+  scan:
+    name: scan
+    needs: [prepare, build-push]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: read # tirer l'image (paquet privé)
+    env:
+      IMAGE_REF: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Trivy (HIGH et CRITICAL corrigeables = échec)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true # on ne bloque pas sur ce qu'aucun correctif ne règle
+          exit-code: "1"
+          format: table
+          output: trivy.txt
+      # Rapport dans le résumé du run, que le scan passe ou non
+      - if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "### Trivy : \`$IMAGE_REF\`"
+            echo '```'
+            if [ -s trivy.txt ]; then cat trivy.txt; else echo "Aucune vulnérabilité HIGH/CRITICAL corrigeable."; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------- deploy-staging : automatique ------------------------------------
+  deploy-staging:
+    name: deploy-staging
+    needs: [prepare, scan]
+    # !cancelled() : tourner aussi quand scan a été SAUTÉ (rollback sans build).
+    if: >-
+      !cancelled()
+      && needs.prepare.outputs.staging == 'true'
+      && (needs.scan.result == 'success' || needs.scan.result == 'skipped')
+    runs-on: [self-hosted, deploy]
+    timeout-minutes: 15
+    environment:
+      name: staging
+      url: ${{ vars.APP_URL }} # variable de l'environment (lien affiché sur le run)
+    # Un déploiement à la fois par environnement, jamais interrompu à mi-chemin.
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read # docker pull sur le serveur
+    env:
+      ENV_NAME: staging
+      TAG: ${{ needs.prepare.outputs.tag }}
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+    steps:
+      - &check
+        name: Vérifier le dossier de l'environnement
+        run: |
+          [ -n "$DEPLOY_DIR" ] || { echo "::error::Variable DEPLOY_DIR absente de l'environment $ENV_NAME"; exit 1; }
+          [ -f "$DEPLOY_DIR/.env" ] || { echo "::error::$DEPLOY_DIR/.env absent : voir docs/DEPLOIEMENT.md"; exit 1; }
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Seuls les fichiers VERSIONNÉS sont copiés : .env, certs/ et backups/ restent intacts.
+      - &copy
+        name: Copier compose.prod.yaml et deploy/
+        run: |
+          mkdir -p "$DEPLOY_DIR/deploy"
+          cp compose.prod.yaml "$DEPLOY_DIR/"
+          cp -R deploy/. "$DEPLOY_DIR/deploy/"
+          chmod +x "$DEPLOY_DIR"/deploy/*.sh
+      - &login
+        name: Connexion à ghcr.io
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      # deploy.sh : (sauvegarde en prod), up --wait, smoke test, rollback auto si KO.
+      - &deploy
+        name: Déployer
+        run: '"$DEPLOY_DIR/deploy/deploy.sh" "$ENV_NAME" "$TAG"'
+      # Runner persistant : ne pas laisser d'identifiants au job suivant.
+      - &logout
+        name: Déconnexion de ghcr.io
+        if: always()
+        run: docker logout ghcr.io || true
+
+  # ---------- deploy-production : après staging vert ET approbation -----------
+  deploy-production:
+    name: deploy-production
+    needs: [prepare, scan, deploy-staging]
+    if: >-
+      !cancelled()
+      && needs.prepare.outputs.production == 'true'
+      && (needs.scan.result == 'success' || needs.scan.result == 'skipped')
+      && (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    runs-on: [self-hosted, deploy]
+    timeout-minutes: 15
+    # Les « required reviewers » de cet environment mettent le job en attente
+    # (Review deployments). Sans reviewers : déploiement continu, même YAML.
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    env:
+      ENV_NAME: production
+      TAG: ${{ needs.prepare.outputs.tag }}
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+    steps:
+      - *check
+      - *checkout
+      - *copy
+      - *login
+      - *deploy
+      - *logout

@@ -1,0 +1,48 @@
+# =============================================================================
+# Runner GitHub Actions self-hosted, dans un conteneur (cible « runner local »)
+#
+# Installé HORS du dépôt du projet, sur la machine qui héberge staging et
+# production (ex. ~/runners/monapp/) :
+#   cp env.example .env && chmod 600 .env   # puis REPO_URL, RUNNER_TOKEN, DEPLOY_ROOT
+#   docker compose up -d
+#   docker compose logs -f runner          # attendu : « Listening for Jobs »
+#
+# Il prend les jobs `runs-on: [self-hosted, deploy]` (deploy-staging,
+# deploy-production) et pilote le Docker de la machine par son socket.
+#
+# ATTENTION : monter /var/run/docker.sock = donner l'équivalent d'un accès ROOT à
+# la machine à tout job qui tourne ici. D'où : dépôt public → exiger
+# l'approbation des workflows des contributeurs externes (Settings → Actions →
+# General), et ne jamais lancer ce runner sur `pull_request`.
+# =============================================================================
+name: runner
+
+services:
+  runner:
+    # Ubuntu + agent actions/runner + docker CLI et plugin compose + git, curl, jq.
+    # Il s'enregistre seul au démarrage avec REPO_URL et RUNNER_TOKEN.
+    image: myoung34/github-runner:ubuntu-noble
+    env_file: .env
+    environment:
+      RUNNER_SCOPE: repo # runner rattaché à UN dépôt
+      RUNNER_NAME: ${RUNNER_NAME:-deploy-runner}
+      LABELS: deploy # + self-hosted, linux, x64 ajoutés d'office
+      RUNNER_WORKDIR: /tmp/runner/work
+      # Garde l'enregistrement dans le volume `data` : le jeton d'enregistrement
+      # (valable 1 h) n'est utilisé qu'au tout premier démarrage.
+      CONFIGURED_ACTIONS_RUNNER_FILES_DIR: /runner/data
+      DISABLE_AUTOMATIC_DEREGISTRATION: "true" # un redémarrage ne désenregistre pas le runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # MÊME chemin dans le conteneur et sur la machine : quand le runner lance
+      # `docker compose up`, c'est le Docker de la MACHINE qui résout les volumes
+      # (./deploy/nginx/app.conf, ./certs…). Les chemins doivent exister à l'identique.
+      - ${DEPLOY_ROOT:?DEPLOY_ROOT manquant dans .env}:${DEPLOY_ROOT}
+      - data:/runner/data
+    extra_hosts:
+      # Le smoke test (dans le conteneur) joint les ports publiés sur la machine
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  data:

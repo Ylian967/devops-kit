@@ -1,0 +1,278 @@
+# =============================================================================
+# release.yml : livraison continue, cible « VPS en SSH »
+#
+#   push sur main
+#     prepare ─▶ build-push ─▶ scan ─▶ deploy-staging ─▶ (approbation) ─▶ deploy-production
+#               (ghcr.io:<sha>) (Trivy)  (automatique)                     (environment protégé)
+#
+# Build once, deploy many : une seule image par commit, taguée par le SHA court,
+# déployée telle quelle en staging puis en production. Rien n'est reconstruit.
+#
+# Tout tourne chez GitHub (ubuntu-latest). Les jobs de déploiement se connectent
+# en SSH au serveur (VPS) de l'environnement, y copient les fichiers versionnés
+# et y lancent deploy/deploy.sh. Rien n'est installé sur le serveur à part
+# Docker, et le serveur n'a besoin d'aucun accès à GitHub en dehors du pull.
+#
+# Rollback : Actions → Release → Run workflow, `tag` = SHA court déjà publié,
+# `environment` = cible. Build et scan sont sautés. deploy.sh revient aussi
+# TOUT SEUL à la version précédente si le smoke test échoue.
+#
+# Prérequis (voir docs/DEPLOIEMENT.md), dans CHAQUE environment GitHub
+# (`staging`, `production` avec required reviewers) :
+#   variables : SSH_HOST, SSH_USER, SSH_KNOWN_HOSTS (ligne de `ssh-keyscan`),
+#               DEPLOY_DIR (ex. /opt/monapp/production), APP_URL ;
+#   secret    : SSH_PRIVATE_KEY (clé dédiée au déploiement, sans phrase de passe).
+# Un secret d'environment n'est lisible qu'APRÈS l'approbation : la clé de la
+# production ne sort pas tant que personne n'a validé.
+# Sur le serveur : Docker, un utilisateur de déploiement dans le groupe docker,
+# DEPLOY_DIR avec .env et certs/.
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: # un commit de documentation ne livre rien
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Rollback : SHA court (7 caractères) d'une image déjà publiée. Vide = livrer main."
+        required: false
+        default: ""
+        type: string
+      environment:
+        description: "Rollback : environnement à redéployer (ignoré si tag est vide)"
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+
+# Aucun droit par défaut : chaque job déclare le strict nécessaire.
+permissions: {}
+
+jobs:
+  # ---------- prepare : décider QUOI faire, valider les entrées -------------
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      image: ${{ steps.plan.outputs.image }}
+      build: ${{ steps.plan.outputs.build }}
+      staging: ${{ steps.plan.outputs.staging }}
+      production: ${{ steps.plan.outputs.production }}
+    steps:
+      - id: plan
+        # Les entrées passent par `env:` : écrire ${{ inputs.tag }} directement
+        # dans le script permettrait d'y injecter des commandes shell.
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_ENV: ${{ inputs.environment }}
+        run: |
+          # ghcr.io exige un nom en minuscules ; ${VAR,,} = minuscules en bash
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          if [ -z "$INPUT_TAG" ]; then
+            # Livraison normale : seulement depuis main
+            [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::On ne livre que main ($GITHUB_REF)"; exit 1; }
+            tag="${GITHUB_SHA::7}"; build=true; staging=true; production=true
+          else
+            # Rollback : un SHA court, rien d'autre (il finit dans des commandes)
+            [[ "$INPUT_TAG" =~ ^[0-9a-f]{7}$ ]] || { echo "::error::tag attendu : 7 caractères hexadécimaux"; exit 1; }
+            tag="$INPUT_TAG"; build=false
+            staging=false; production=false
+            if [ "$INPUT_ENV" = production ]; then production=true; else staging=true; fi
+          fi
+          printf 'tag=%s\nbuild=%s\nstaging=%s\nproduction=%s\n' "$tag" "$build" "$staging" "$production" >> "$GITHUB_OUTPUT"
+          printf '### Plan\n| Tag | Build | Staging | Production |\n|---|---|---|---|\n| `%s` | %s | %s | %s |\n' \
+            "$tag" "$build" "$staging" "$production" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------- build-push : construire et publier l'image ---------------------
+  build-push:
+    name: build-push
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # lire le code
+      packages: write # publier sur ghcr.io
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      # Actions épinglées par SHA de commit (un tag peut être déplacé, pas un SHA) ;
+      # la version est en commentaire et Dependabot les met à jour.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # jeton du run, expire à la fin du job
+      - name: Construire et publier ${{ env.IMAGE }}:${{ env.TAG }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }} # SHA court seulement : jamais `latest` pour déployer
+          build-args: |
+            APP_VERSION=${{ env.TAG }}
+          # Relie le paquet ghcr.io au dépôt (droits d'accès hérités du dépôt)
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: 'echo "Publié : \`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"'
+
+  # ---------- scan : Trivy sur l'image publiée --------------------------------
+  # Publiée mais pas encore déployée : rien ne part en staging si le scan échoue.
+  scan:
+    name: scan
+    needs: [prepare, build-push]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: read # tirer l'image (paquet privé)
+    env:
+      IMAGE_REF: ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Trivy (HIGH et CRITICAL corrigeables = échec)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true # on ne bloque pas sur ce qu'aucun correctif ne règle
+          exit-code: "1"
+          format: table
+          output: trivy.txt
+      # Rapport dans le résumé du run, que le scan passe ou non
+      - if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "### Trivy : \`$IMAGE_REF\`"
+            echo '```'
+            if [ -s trivy.txt ]; then cat trivy.txt; else echo "Aucune vulnérabilité HIGH/CRITICAL corrigeable."; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------- deploy-staging : automatique ------------------------------------
+  deploy-staging:
+    name: deploy-staging
+    needs: [prepare, scan]
+    # !cancelled() : tourner aussi quand scan a été SAUTÉ (rollback sans build).
+    if: >-
+      !cancelled()
+      && needs.prepare.outputs.staging == 'true'
+      && (needs.scan.result == 'success' || needs.scan.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: staging
+      url: ${{ vars.APP_URL }} # variable de l'environment (lien affiché sur le run)
+    # Un déploiement à la fois par environnement, jamais interrompu à mi-chemin.
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read # le jeton transmis au serveur ne sert qu'au docker pull
+    env:
+      ENV_NAME: staging
+      TAG: ${{ needs.prepare.outputs.tag }}
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+      SSH_TARGET: ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }}
+    steps:
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Clé privée dans un fichier 600 ; known_hosts fourni : on VÉRIFIE l'identité
+      # du serveur (jamais StrictHostKeyChecking=no, qui accepterait un imposteur).
+      - &ssh
+        name: Préparer SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+        run: |
+          for v in SSH_PRIVATE_KEY SSH_KNOWN_HOSTS DEPLOY_DIR; do
+            [ -n "${!v}" ] || { echo "::error::$v absent de l'environment $ENV_NAME"; exit 1; }
+          done
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host cible\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/deploy_key\n  IdentitiesOnly yes\n  BatchMode yes\n' \
+            "${SSH_TARGET#*@}" "${SSH_TARGET%@*}" > ~/.ssh/config
+          ssh cible true   # échoue tout de suite si la clé ou l'empreinte ne vont pas
+      # Seuls les fichiers VERSIONNÉS sont copiés : .env, certs/ et backups/ restent intacts.
+      # printf %q : le chemin est protégé avant d'être interprété par le shell distant.
+      - &copy
+        name: Copier compose.prod.yaml et deploy/
+        run: |
+          dir="$(printf '%q' "$DEPLOY_DIR")"
+          ssh cible "mkdir -p $dir"
+          scp -q compose.prod.yaml "cible:$DEPLOY_DIR/"
+          scp -q -r deploy "cible:$DEPLOY_DIR/"   # fusionne dans $DEPLOY_DIR/deploy/
+          ssh cible "chmod +x $dir/deploy/*.sh"
+      # Le jeton passe par l'entrée standard (jamais dans la ligne de commande,
+      # visible dans `ps`). Il expire à la fin du job.
+      - &login
+        name: Connexion du serveur à ghcr.io
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | ssh cible "docker login ghcr.io -u $(printf '%q' "$GITHUB_ACTOR") --password-stdin"
+      # deploy.sh : (sauvegarde en prod), up --wait, smoke test, rollback auto si KO.
+      # TAG et ENV_NAME ont été validés par prepare (hexadécimal, staging|production).
+      - &deploy
+        name: Déployer
+        run: ssh cible "$(printf '%q' "$DEPLOY_DIR")/deploy/deploy.sh $ENV_NAME $TAG"
+      - &logout
+        name: Déconnexion et nettoyage
+        if: always()
+        run: |
+          ssh cible "docker logout ghcr.io" || true
+          rm -f ~/.ssh/deploy_key
+
+  # ---------- deploy-production : après staging vert ET approbation -----------
+  deploy-production:
+    name: deploy-production
+    needs: [prepare, scan, deploy-staging]
+    if: >-
+      !cancelled()
+      && needs.prepare.outputs.production == 'true'
+      && (needs.scan.result == 'success' || needs.scan.result == 'skipped')
+      && (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Les « required reviewers » de cet environment mettent le job en attente
+    # (Review deployments). Sans reviewers : déploiement continu, même YAML.
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    env:
+      ENV_NAME: production
+      TAG: ${{ needs.prepare.outputs.tag }}
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+      SSH_TARGET: ${{ vars.SSH_USER }}@${{ vars.SSH_HOST }}
+    steps:
+      - *checkout
+      - *ssh
+      - *copy
+      - *login
+      - *deploy
+      - *logout
