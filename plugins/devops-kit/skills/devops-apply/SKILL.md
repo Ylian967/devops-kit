@@ -28,7 +28,9 @@ Si le bloc est absent ou inconnu, liste les blocs disponibles (dossiers de `${CL
 ## Procédure (identique pour chaque bloc)
 
 1. **Lire la skill du bloc** : `${CLAUDE_PLUGIN_ROOT}/skills/<bloc>/SKILL.md`, puis la référence de la stack détectée
-   dans son dossier `references/`.
+   dans son dossier `references/`, et les conventions communes à tous les blocs :
+   `${CLAUDE_PLUGIN_ROOT}/skills/devops-apply/references/conventions.md` (noms de services, variables, `/health`,
+   images, environnements, chemins).
 2. **Vérifier les dépendances** listées par la skill. Une dépendance absente : propose de l'appliquer d'abord (même
    procédure), ou de continuer en sachant ce qui manquera.
 3. **Partir d'un arbre propre.** `git status --porcelain` non vide : demande s'il faut mettre de côté (`git stash -u`)
