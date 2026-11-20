@@ -1,0 +1,124 @@
+# =============================================================================
+# monitoring/compose.monitoring.yaml : la supervision de staging et production.
+#
+#   prometheus ──scrape 15 s──▶ <repo>-<env>-app-1:3000/metrics   (boîte blanche)
+#        │      ──/probe──────▶ blackbox ──▶ /health interne + URL publique (boîte noire)
+#        ├──alertes──▶ alertmanager ──▶ webhook / Discord / mail
+#        └◀──requêtes── grafana (datasource et dashboard provisionnés)
+#
+# Une seule stack par machine : elle REJOINT les réseaux des environnements qui
+# tournent sur cette machine (<repo>-<env>_default, créés par compose.prod.yaml)
+# et y lit /metrics directement : /metrics ne passe jamais par le proxy public.
+# Ces réseaux doivent exister AVANT le démarrage (environnement déployé), sinon :
+# « network monapp-staging_default declared as external, but could not be found ».
+#
+# Lancement (dans le dossier qui contient ce fichier et son .env) :
+#   docker compose -f compose.monitoring.yaml up -d
+#
+# Rien n'est ouvert au réseau : les ports sont publiés sur 127.0.0.1. Depuis un
+# autre poste, passer par un tunnel SSH (voir docs/INCIDENTS.md) :
+#   ssh -N -L 3001:127.0.0.1:3001 -L 9090:127.0.0.1:9090 -L 9093:127.0.0.1:9093 deploy@serveur
+#
+# À adapter : « monapp » (nom du dépôt), les environnements présents sur la
+# machine (supprimer le réseau de celui qui tourne ailleurs).
+# =============================================================================
+
+# Nom de projet Compose : préfixe conteneurs (monapp-monitoring-prometheus-1),
+# volumes et réseau interne. Distinct des projets <repo>-<env> : un `down` de
+# la supervision ne touche jamais à l'application.
+name: monapp-monitoring
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.16.0 # version précise : pas de surprise à la mise à jour
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus # où sont stockées les séries (volume ci-dessous)
+      - --storage.tsdb.retention.time=15d # durée de conservation des mesures
+      - --storage.tsdb.retention.size=2GB # garde-fou disque : les plus anciennes partent d'abord
+      - --web.enable-lifecycle # POST /-/reload : relire la config sans redémarrer
+      - --web.external-url=http://localhost:${PROMETHEUS_PORT:-9090} # lien « source » des alertes (via le tunnel)
+    ports:
+      # 127.0.0.1 : joignable seulement depuis la machine (ou un tunnel SSH).
+      # Prometheus n'a AUCUNE authentification : jamais de « 9090:9090 » nu.
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      # prometheus.yml, rules/ et tests/ : `promtool test rules` marche aussi
+      # dans le conteneur (/etc/prometheus/tests/alertes.test.yml).
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    # monitoring : pour joindre alertmanager et blackbox ; staging et production :
+    # pour lire /metrics des applications par le nom de leur conteneur.
+    networks: [monitoring, staging, production]
+    restart: unless-stopped
+
+  blackbox:
+    image: prom/blackbox-exporter:v0.29.1
+    command:
+      - --config.file=/etc/blackbox/blackbox.yml
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    # Pas de port publié : seul Prometheus l'interroge (blackbox:9115).
+    # Sur les réseaux des environnements pour sonder /health en interne ; le
+    # réseau monitoring lui donne aussi l'accès sortant vers l'URL publique.
+    networks: [monitoring, staging, production]
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.35.0
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager # silences et état des notifications
+      - --web.external-url=http://localhost:${ALERTMANAGER_PORT:-9093}
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093" # pas d'authentification non plus
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # URL de webhook, mot de passe SMTP… : un fichier par secret, dans
+      # monitoring/secrets/ (jamais versionné, chmod 600), lu par *_file.
+      - ./secrets:/etc/alertmanager/secrets:ro
+      - alertmanager-data:/alertmanager
+    networks: [monitoring] # n'a besoin que de Prometheus et d'Internet
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.6
+    ports:
+      # Port 3001 : 3000 est souvent pris par l'application en dev.
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      # Lu UNIQUEMENT au premier démarrage (il est ensuite stocké dans le volume) :
+      # pour le changer après, `grafana cli admin reset-admin-password` dans le conteneur.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD manquant dans .env}
+      GF_USERS_ALLOW_SIGN_UP: "false" # personne ne crée de compte tout seul
+      GF_AUTH_ANONYMOUS_ENABLED: "false" # pas de lecture sans connexion
+      GF_ANALYTICS_REPORTING_ENABLED: "false" # pas de statistiques d'usage envoyées
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Le dashboard du projet en page d'accueil.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/application.json
+    volumes:
+      # « Monitoring as code » : datasource et dashboards viennent de Git ; un
+      # `down -v` puis `up` redonne le même Grafana.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana # utilisateurs, préférences
+    depends_on: [prometheus]
+    networks: [monitoring]
+    restart: unless-stopped
+
+networks:
+  monitoring: {} # réseau interne de la supervision, créé par ce fichier
+  # Réseaux des environnements : on s'y RACCORDE (external), on ne les crée pas.
+  # Nom = <COMPOSE_PROJECT_NAME de l'environnement>_default.
+  staging:
+    name: monapp-staging_default
+    external: true
+  production:
+    name: monapp-production_default
+    external: true
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

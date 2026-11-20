@@ -1,0 +1,66 @@
+# =============================================================================
+# monitoring/alertmanager/alertmanager.yml : QUI prévenir, COMMENT, sans spammer.
+# Prometheus décide qu'une alerte est active ; Alertmanager la regroupe, la
+# déduplique, applique les inhibitions et envoie la notification.
+#
+# Aucun secret ici (fichier versionné) : chaque URL ou mot de passe est lu
+# depuis un fichier de monitoring/secrets/ (jamais versionné, chmod 600),
+# monté sur /etc/alertmanager/secrets/ par compose.monitoring.yaml.
+#
+# Vérifier, puis recharger :
+#   docker compose -f compose.monitoring.yaml exec alertmanager amtool check-config /etc/alertmanager/alertmanager.yml
+#   curl -X POST http://127.0.0.1:9093/-/reload
+# Envoyer une fausse alerte pour tester le destinataire :
+#   docker compose -f compose.monitoring.yaml exec alertmanager amtool alert add Essai severity=warning env=staging \
+#     --annotation=summary="Test de notification" --alertmanager.url=http://127.0.0.1:9093
+# =============================================================================
+
+global:
+  resolve_timeout: 5m # une alerte qui n'est plus renvoyée par Prometheus est close après 5 min
+
+route:
+  receiver: equipe # destinataire par défaut (défini plus bas)
+  group_by: ["alertname", "env"] # une notification par (alerte, environnement)
+  group_wait: 30s # attendre les alertes sœurs avant la première notification
+  group_interval: 5m # délai avant de notifier un changement dans un groupe déjà notifié
+  repeat_interval: 4h # rappel tant que l'alerte reste active
+  routes:
+    # Le Watchdog n'est pas un problème : jamais notifié. (Pour un vrai « dead
+    # man's switch », l'envoyer toutes les minutes à un service externe de
+    # battement de cœur, qui prévient quand il ne reçoit PLUS rien.)
+    - matchers: ['alertname = "Watchdog"']
+      receiver: personne
+
+receivers:
+  - name: personne # aucun canal : l'alerte reste visible dans l'interface
+
+  - name: equipe
+    # Webhook générique : Alertmanager POSTe un JSON (alertes, labels,
+    # annotations) à l'URL contenue dans le fichier. Convient à n8n, ntfy (via
+    # un relais), un petit service maison…
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/webhook-url
+        send_resolved: true # prévenir aussi du retour à la normale
+
+    # Discord (le plus courant en perso) : URL du webhook du salon dans
+    # monitoring/secrets/discord-webhook-url, puis décommenter.
+    # discord_configs:
+    #   - webhook_url_file: /etc/alertmanager/secrets/discord-webhook-url
+    #     send_resolved: true
+
+    # Mail : un SMTP avec authentification (TLS exigé par défaut).
+    # email_configs:
+    #   - to: moi@example.com
+    #     from: alertes@example.com
+    #     smarthost: smtp.example.com:587
+    #     auth_username: alertes@example.com
+    #     auth_password_file: /etc/alertmanager/secrets/smtp-password
+    #     send_resolved: true
+
+# Quand l'application est indisponible (critical), inutile de recevoir aussi
+# « cible illisible », « 5xx » ou « latence » (warning) pour le MÊME environnement :
+# une seule notification, celle du symptôme.
+inhibit_rules:
+  - source_matchers: ['severity = "critical"']
+    target_matchers: ['severity = "warning"']
+    equal: ["env"]

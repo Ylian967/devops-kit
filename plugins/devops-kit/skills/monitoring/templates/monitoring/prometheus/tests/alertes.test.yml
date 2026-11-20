@@ -1,0 +1,197 @@
+# =============================================================================
+# monitoring/prometheus/tests/alertes.test.yml : tests unitaires des alertes.
+# On SIMULE des séries et on vérifie quelles alertes sont actives à un instant
+# donné : une règle cassée échoue ici, pas en production un soir de panne.
+#
+#   cd monitoring/prometheus && promtool test rules tests/alertes.test.yml
+#
+# Notation des valeurs (un point par `interval`) :
+#   "1x8"      = 1 répété : 9 points (1 + 8 répétitions)
+#   "0+90x60"  = 0, 90, 180… : un compteur qui monte de 90 à chaque point
+#   "1 1 0 0"  = valeurs listées une à une
+# Une alerte « pending » (condition vraie depuis moins que son `for:`) n'apparaît
+# pas dans exp_alerts : on ne voit que les alertes « firing ».
+# Les annotations attendues sont comparées AU CARACTÈRE PRÈS : toute
+# modification d'un texte dans rules/alertes.yml se reporte ici.
+# =============================================================================
+
+rule_files:
+  - ../rules/alertes.yml # relatif à ce fichier
+
+evaluation_interval: 15s
+
+tests:
+  # --- L'application tombe : /health KO et /metrics illisible -------------------
+  - name: AppIndisponible et CibleIllisible après 2 minutes de panne
+    interval: 15s
+    input_series:
+      # ok pendant 1 min (4 points), puis en échec à partir de t = 60 s
+      - series: 'probe_success{job="blackbox-health", env="production", sonde="interne", instance="http://monapp-production-app-1:3000/health"}'
+        values: "1 1 1 1 0x20"
+      - series: 'up{job="app", env="production", instance="monapp-production-app-1:3000"}'
+        values: "1 1 1 1 0x20"
+    alert_rule_test:
+      # en échec depuis 1 min : « pending » seulement (for: 2m), rien n'est notifié
+      - eval_time: 2m
+        alertname: AppIndisponible
+        exp_alerts: []
+      # en échec depuis 2 min 30 : « firing »
+      - eval_time: 3m30s
+        alertname: AppIndisponible
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: blackbox-health
+              env: production
+              sonde: interne
+              instance: http://monapp-production-app-1:3000/health
+            exp_annotations:
+              summary: "production : /health ne répond plus (sonde interne)"
+              description: 'La sonde sur http://monapp-production-app-1:3000/health échoue depuis plus de 2 minutes : code HTTP, corps ("status":"ok") ou délai de 5 s.'
+              runbook_url: "docs/INCIDENTS.md#appindisponible"
+      # elle se déclenche aussi ; Alertmanager l'inhibe (critical du même env)
+      - eval_time: 3m30s
+        alertname: CibleIllisible
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: app
+              env: production
+              instance: monapp-production-app-1:3000
+            exp_annotations:
+              summary: "Prometheus ne collecte plus app (monapp-production-app-1:3000)"
+              description: "La collecte échoue depuis plus de 2 minutes ; l'erreur exacte est dans Status > Targets."
+              runbook_url: "docs/INCIDENTS.md#cibleillisible"
+
+  # --- Un redémarrage de déploiement (30 s) ne déclenche rien ----------------
+  - name: Coupure brève pendant un déploiement
+    interval: 15s
+    input_series:
+      - series: 'probe_success{job="blackbox-health", env="production", sonde="interne", instance="http://monapp-production-app-1:3000/health"}'
+        values: "1 1 1 1 0 0 1x20" # 30 s d'échec puis retour à la normale
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AppIndisponible
+        exp_alerts: []
+
+  # --- 10 % de 5xx avec du trafic : alerte ------------------------------------
+  - name: TauxErreur5xxEleve au-dessus de 5 % de 5xx
+    interval: 15s
+    input_series:
+      - series: 'http_requests_total{job="app", env="production", method="GET", route="/tasks", status="200"}'
+        values: "0+90x60"
+      - series: 'http_requests_total{job="app", env="production", method="POST", route="/tasks", status="500"}'
+        values: "0+10x60"
+    promql_expr_test:
+      - expr: env:http_requests_5xx:ratio5m
+        eval_time: 12m
+        exp_samples:
+          - labels: 'env:http_requests_5xx:ratio5m{env="production"}'
+            value: 0.1
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: TauxErreur5xxEleve
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              env: production
+            exp_annotations:
+              summary: "production : trop de réponses 5xx"
+              description: "10% des requêtes échouent en 5xx depuis 5 minutes (seuil : 5 %)."
+              runbook_url: "docs/INCIDENTS.md#tauxerreur5xxeleve"
+
+  # --- 50 % de 5xx mais presque aucun trafic : pas d'alerte -------------------
+  - name: TauxErreur5xxEleve ignore un trafic trop faible
+    interval: 15s
+    input_series:
+      - series: 'http_requests_total{job="app", env="staging", method="GET", route="/tasks", status="200"}'
+        values: "0+0.1x60" # environ 1 requête toutes les 2 min 30
+      - series: 'http_requests_total{job="app", env="staging", method="GET", route="/tasks", status="500"}'
+        values: "0+0.1x60"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: TauxErreur5xxEleve
+        exp_alerts: []
+
+  # --- p95 vers 970 ms pendant plus de 10 min : alerte ------------------------
+  - name: LatenceElevee au-dessus de 500 ms
+    interval: 15s
+    input_series:
+      - series: 'http_requests_total{job="app", env="production", method="GET", route="/tasks", status="200"}'
+        values: "0+10x60"
+      # par point : 2 requêtes sous 0,5 s, 8 entre 0,5 et 1 s
+      - series: 'http_request_duration_seconds_bucket{job="app", env="production", le="0.5"}'
+        values: "0+2x60"
+      - series: 'http_request_duration_seconds_bucket{job="app", env="production", le="1"}'
+        values: "0+10x60"
+      - series: 'http_request_duration_seconds_bucket{job="app", env="production", le="+Inf"}'
+        values: "0+10x60"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: LatenceElevee
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              env: production
+            exp_annotations:
+              summary: "production : latence p95 dégradée"
+              description: "p95 = 968.8ms depuis 10 minutes (seuil : 500 ms)."
+              runbook_url: "docs/INCIDENTS.md#latenceelevee"
+
+  # --- Certificat qui expire dans 10 jours -----------------------------------
+  - name: CertificatExpireBientot sous 14 jours
+    interval: 1m
+    input_series:
+      # date d'expiration (secondes depuis 1970) : 10 jours après t = 0
+      - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-health", env="production", sonde="publique", instance="https://app.example.com/health"}'
+        values: "864000x180"
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: CertificatExpireBientot
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: blackbox-health
+              env: production
+              sonde: publique
+              instance: https://app.example.com/health
+            exp_annotations:
+              summary: "production : le certificat expire dans 10 jours"
+              description: "Certificat présenté par https://app.example.com/health ; vérifier le renouvellement (docs/DEPLOIEMENT.md)."
+              runbook_url: "docs/INCIDENTS.md#certificatexpirebientot"
+
+  # --- Fonctionnement normal : rien, sauf le Watchdog ------------------------
+  - name: Aucune alerte au nominal
+    interval: 15s
+    input_series:
+      - series: 'probe_success{job="blackbox-health", env="production", sonde="interne", instance="http://monapp-production-app-1:3000/health"}'
+        values: "1x60"
+      - series: 'up{job="app", env="production", instance="monapp-production-app-1:3000"}'
+        values: "1x60"
+      - series: 'http_requests_total{job="app", env="production", method="GET", route="/tasks", status="200"}'
+        values: "0+100x60"
+      - series: 'http_request_duration_seconds_bucket{job="app", env="production", le="0.05"}'
+        values: "0+100x60"
+      - series: 'http_request_duration_seconds_bucket{job="app", env="production", le="+Inf"}'
+        values: "0+100x60"
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: AppIndisponible
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: CibleIllisible
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: TauxErreur5xxEleve
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: LatenceElevee
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels:
+              severity: none
+            exp_annotations:
+              summary: "Watchdog : la chaîne d'alerte fonctionne"
+              description: "Toujours active. Si elle disparaît d'Alertmanager, c'est Prometheus ou Alertmanager qui est en panne."

@@ -1,0 +1,87 @@
+# =============================================================================
+# monitoring/prometheus/prometheus.yml : QUOI collecter, à quel rythme, et où
+# envoyer les alertes. Prometheus TIRE (pull) : c'est lui qui appelle les cibles.
+#
+# Les cibles sont désignées par le NOM DU CONTENEUR (<repo>-<env>-<service>-1),
+# pas par le nom de service : `app` existe dans staging ET dans production, et
+# Prometheus est branché sur les deux réseaux ; le nom du conteneur, lui, est unique.
+#
+# À adapter : « monapp » (nom du dépôt), le port interne (Node/Next.js 3000,
+# Java/Rust 8080, Phoenix 4000), les URL publiques, les environnements absents
+# de cette machine (un environnement sur un autre serveur : ne garder que sa
+# sonde publique).
+#
+# Vérifier, puis recharger sans redémarrer :
+#   docker compose -f compose.monitoring.yaml exec prometheus promtool check config /etc/prometheus/prometheus.yml
+#   curl -X POST http://127.0.0.1:9090/-/reload
+# =============================================================================
+
+global:
+  scrape_interval: 15s # une collecte toutes les 15 s
+  evaluation_interval: 15s # les règles d'alerte sont évaluées au même rythme
+  scrape_timeout: 10s # une cible plus lente est comptée « down » (up = 0)
+
+# Chemin RELATIF au fichier : marche dans le conteneur (/etc/prometheus/rules)
+# comme pour `promtool check config` lancé depuis monitoring/prometheus/.
+rule_files:
+  - rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"] # nom de service, réseau « monitoring »
+
+scrape_configs:
+  # Prometheus se surveille lui-même : son `up` sert de témoin.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # --- Boîte blanche : ce que l'application dit d'elle-même (GET /metrics) ----
+  # Le label `env` est ajouté ici : les règles et le dashboard filtrent dessus.
+  - job_name: app
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["monapp-staging-app-1:3000"]
+        labels:
+          env: staging
+      - targets: ["monapp-production-app-1:3000"]
+        labels:
+          env: production
+    # Java (Micrometer), Elixir… : renommage des métriques vers les noms communs
+    # ici (metric_relabel_configs), voir references/<stack>.md du bloc monitoring.
+
+  # --- Boîte noire : ce que voit un client (sonde HTTP de blackbox) -----------
+  # Deux sondes par environnement :
+  #   interne  : /health de l'application, sans le proxy (l'app répond-elle ?)
+  #   publique : /health par l'URL publique (DNS, proxy, TLS, certificat compris)
+  # Une seule en échec indique déjà où chercher.
+  - job_name: blackbox-health
+    metrics_path: /probe # blackbox sonde la cible donnée dans ?target=
+    params:
+      module: [http_health] # module défini dans blackbox/blackbox.yml
+    static_configs:
+      - targets: ["http://monapp-staging-app-1:3000/health"]
+        labels: { env: staging, sonde: interne }
+      - targets: ["https://staging.app.example.com/health"]
+        labels: { env: staging, sonde: publique }
+      - targets: ["http://monapp-production-app-1:3000/health"]
+        labels: { env: production, sonde: interne }
+      - targets: ["https://app.example.com/health"]
+        labels: { env: production, sonde: publique }
+    # L'astuce classique de blackbox : la cible listée plus haut devient le
+    # paramètre ?target=, l'adresse réellement appelée est celle de blackbox, et
+    # le label instance garde l'URL sondée (lisible dans les alertes).
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target # ?target=<URL sondée>
+      - source_labels: [__param_target]
+        target_label: instance # instance = l'URL sondée, pas blackbox:9115
+      - target_label: __address__
+        replacement: blackbox:9115 # c'est blackbox qu'on collecte
+
+  # L'exporteur blackbox lui-même : s'il tombe, plus aucune sonde, et l'alerte
+  # CibleIllisible le dit (sinon AppIndisponible se tairait faute de données).
+  - job_name: blackbox
+    static_configs:
+      - targets: ["blackbox:9115"]

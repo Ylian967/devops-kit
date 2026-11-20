@@ -1,0 +1,20 @@
+# =============================================================================
+# grafana/provisioning/dashboards/dashboards.yml : charge au démarrage chaque
+# fichier JSON de /var/lib/grafana/dashboards (= monitoring/grafana/dashboards/).
+#
+# Modifier un dashboard : le changer dans l'interface ne tient pas (lecture
+# seule). Faire la modification sur une copie (Save as), puis Export > Export as
+# JSON, remplacer le fichier dans Git, committer : Grafana le relit tout seul.
+# =============================================================================
+apiVersion: 1
+
+providers:
+  - name: devops-kit
+    orgId: 1 # organisation par défaut de Grafana
+    folder: Application # dossier affiché dans Grafana
+    type: file # dashboards lus depuis des fichiers
+    disableDeletion: true # impossible de supprimer depuis l'interface
+    allowUiUpdates: false # Git reste la seule source de vérité
+    updateIntervalSeconds: 30 # relit les fichiers toutes les 30 s
+    options:
+      path: /var/lib/grafana/dashboards # monté depuis monitoring/grafana/dashboards

@@ -1,0 +1,52 @@
+# =============================================================================
+# monitoring/blackbox/blackbox.yml : modules de sonde de blackbox_exporter.
+# Prometheus choisit le module par le paramètre ?module= (prometheus.yml).
+#
+# Vérifier :
+#   docker run --rm -v "$PWD/monitoring/blackbox":/b prom/blackbox-exporter:v0.29.1 \
+#     --config.file=/b/blackbox.yml --config.check
+# Essayer une sonde à la main (dans le conteneur Prometheus, même réseau) :
+#   curl 'http://blackbox:9115/probe?module=http_health&target=https://app.example.com/health&debug=true'
+# =============================================================================
+
+modules:
+  # /health au format commun devops-kit : succès = HTTP 200 en moins de 5 s ET
+  # un corps qui contient "status":"ok". Un 503 (base injoignable, "degraded"),
+  # un 502 du proxy (application tombée) ou un délai dépassé = échec.
+  http_health:
+    prober: http
+    timeout: 5s # sous le scrape_timeout de Prometheus (10 s)
+    http:
+      method: GET
+      valid_status_codes: [200]
+      # Tolère un espace après les deux-points (JSON indenté ou non).
+      fail_if_body_not_matches_regexp:
+        - '"status": ?"ok"'
+      preferred_ip_protocol: ip4 # beaucoup de petits serveurs n'ont pas d'IPv6 sortant
+      # Le certificat de l'URL publique est vérifié : un certificat expiré ou
+      # invalide fait échouer la sonde (c'est ce que verrait un navigateur).
+
+  # Simple « répond en 2xx » : pour une URL qui n'a pas le format /health commun
+  # (service tiers, déploiement Convex, page d'accueil).
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+
+  # Cible runner local avec certificat auto-signé (deploy/gen-cert.sh) : même
+  # contrôle que http_health, sans vérifier le certificat. À n'utiliser QUE
+  # pour le proxy local (https://<repo>-<env>-proxy-1/health), jamais pour une
+  # vraie URL publique.
+  http_health_autosigne:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      fail_if_body_not_matches_regexp:
+        - '"status": ?"ok"'
+      preferred_ip_protocol: ip4
+      tls_config:
+        insecure_skip_verify: true

@@ -1,0 +1,16 @@
+# =============================================================================
+# grafana/provisioning/datasources/prometheus.yml : la source de données,
+# créée au démarrage de Grafana (rien à cliquer, identique à chaque `up`).
+# =============================================================================
+apiVersion: 1 # version du format de provisioning Grafana
+
+datasources:
+  - name: Prometheus
+    uid: prometheus # identifiant fixe : les dashboards JSON y font référence
+    type: prometheus
+    access: proxy # c'est le serveur Grafana qui interroge Prometheus, pas le navigateur
+    url: http://prometheus:9090 # nom de service, réseau « monitoring »
+    isDefault: true
+    editable: false # modifiée dans Git, pas dans l'interface
+    jsonData:
+      timeInterval: 15s # = scrape_interval : $__rate_interval en tient compte

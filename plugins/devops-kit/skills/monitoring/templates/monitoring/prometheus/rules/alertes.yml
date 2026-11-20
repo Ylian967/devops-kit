@@ -1,0 +1,125 @@
+# =============================================================================
+# monitoring/prometheus/rules/alertes.yml : pré-calculs (recording rules) et
+# alertes. Tout repose sur le contrat commun de /metrics :
+#   http_requests_total{method,route,status}
+#   http_request_duration_seconds{method,route,status}   (histogramme)
+# et sur les sondes blackbox (job blackbox-health).
+#
+#   promtool check rules rules/alertes.yml           # syntaxe
+#   promtool test rules tests/alertes.test.yml       # comportement (tests unitaires)
+#
+# Gravité :
+#   critical : les utilisateurs sont touchés, on agit tout de suite
+#   warning  : dégradation, à regarder dans la journée
+# `for:` : la condition doit DURER avant de notifier ; un pic isolé ou le
+# redémarrage d'un déploiement (quelques secondes) ne réveille personne.
+# Chaque alerte dit quoi, où, et renvoie au runbook (docs/INCIDENTS.md).
+# =============================================================================
+
+groups:
+  # --- Pré-calculs : la méthode RED, par environnement -------------------------
+  # Nom « niveau:métrique:opération » (convention Prometheus) : agrégé par env.
+  - name: red
+    rules:
+      # Rate : requêtes par seconde, moyenne sur 5 min.
+      - record: env:http_requests:rate5m
+        expr: sum by (env) (rate(http_requests_total{job="app"}[5m]))
+
+      # Errors : part des réponses 5xx, entre 0 et 1. Les 4xx sont des erreurs
+      # du client (mauvaise URL, formulaire invalide), pas une panne : exclues.
+      - record: env:http_requests_5xx:ratio5m
+        expr: |
+          sum by (env) (rate(http_requests_total{job="app", status=~"5.."}[5m]))
+          /
+          sum by (env) (rate(http_requests_total{job="app"}[5m]))
+
+      # Duration : 95 % des requêtes sont plus rapides que cette valeur (secondes),
+      # interpolée entre les tranches de l'histogramme (d'où des tranches serrées
+      # autour du seuil d'alerte dans le code de /metrics).
+      - record: env:http_request_duration_seconds:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (env, le) (rate(http_request_duration_seconds_bucket{job="app"}[5m])))
+
+  # --- Alertes -----------------------------------------------------------------
+  - name: alertes
+    rules:
+      # Le symptôme : /health ne répond pas 200 + "status":"ok" (code, corps ou
+      # délai), en interne ou par l'URL publique. 2 min : plus long qu'un
+      # redémarrage de déploiement, assez court pour prévenir avant les utilisateurs.
+      - alert: AppIndisponible
+        expr: probe_success{job="blackbox-health"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.env }} : /health ne répond plus (sonde {{ $labels.sonde }})"
+          description: "La sonde sur {{ $labels.instance }} échoue depuis plus de 2 minutes : code HTTP, corps (\"status\":\"ok\") ou délai de 5 s."
+          runbook_url: "docs/INCIDENTS.md#appindisponible"
+
+      # La supervision ne voit plus une cible (application arrêtée, en boucle de
+      # redémarrage, réseau non rejoint, blackbox tombé). Sans cette alerte, une
+      # cible muette ne déclencherait rien : pas de données = pas d'alerte.
+      - alert: CibleIllisible
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus ne collecte plus {{ $labels.job }} ({{ $labels.instance }})"
+          description: "La collecte échoue depuis plus de 2 minutes ; l'erreur exacte est dans Status > Targets."
+          runbook_url: "docs/INCIDENTS.md#cibleillisible"
+
+      # Plus de 5 % de 5xx pendant 5 min, À CONDITION d'avoir un peu de trafic
+      # (≥ 0,05 req/s, environ 15 requêtes en 5 min) : sur un projet perso,
+      # 1 erreur sur 2 requêtes ferait sinon 50 % et une alerte pour rien.
+      - alert: TauxErreur5xxEleve
+        expr: |
+          env:http_requests_5xx:ratio5m > 0.05
+          and on (env) env:http_requests:rate5m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.env }} : trop de réponses 5xx"
+          description: "{{ $value | humanizePercentage }} des requêtes échouent en 5xx depuis 5 minutes (seuil : 5 %)."
+          runbook_url: "docs/INCIDENTS.md#tauxerreur5xxeleve"
+
+      # Latence p95 au-dessus de 500 ms pendant 10 min (même garde de trafic :
+      # un p95 calculé sur trois requêtes ne veut rien dire). Seuil à ajuster à
+      # l'application : le mesurer en temps normal, viser nettement au-dessus.
+      - alert: LatenceElevee
+        expr: |
+          env:http_request_duration_seconds:p95_5m > 0.5
+          and on (env) env:http_requests:rate5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.env }} : latence p95 dégradée"
+          description: "p95 = {{ $value | humanizeDuration }} depuis 10 minutes (seuil : 500 ms)."
+          runbook_url: "docs/INCIDENTS.md#latenceelevee"
+
+      # Certificat HTTPS de l'URL publique qui expire dans moins de 14 jours :
+      # le renouvellement automatique (certbot) a probablement échoué.
+      - alert: CertificatExpireBientot
+        expr: (probe_ssl_earliest_cert_expiry{job="blackbox-health"} - time()) / 86400 < 14
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.env }} : le certificat expire dans {{ $value | printf \"%.0f\" }} jours"
+          description: "Certificat présenté par {{ $labels.instance }} ; vérifier le renouvellement (docs/DEPLOIEMENT.md)."
+          runbook_url: "docs/INCIDENTS.md#certificatexpirebientot"
+
+      # « Dead man's switch » : TOUJOURS active. Visible dans Alertmanager, elle
+      # prouve que la chaîne Prometheus → Alertmanager marche. Elle n'est pas
+      # notifiée (route dédiée dans alertmanager.yml), sauf vers un service de
+      # battement de cœur externe si on en branche un.
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+        annotations:
+          summary: "Watchdog : la chaîne d'alerte fonctionne"
+          description: "Toujours active. Si elle disparaît d'Alertmanager, c'est Prometheus ou Alertmanager qui est en panne."
