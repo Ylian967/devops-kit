@@ -1,7 +1,19 @@
 {
   "name": "devops-kit",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Blocs DevOps applicables à n'importe quel projet : /devops-kit:devops-plan analyse et propose, /devops-kit:devops-apply <bloc> applique.",
-  "author": { "name": "Ylian Merrir" },
-  "keywords": ["devops", "ci", "github-actions", "docker", "git"]
+  "author": {
+    "name": "Ylian Merrir"
+  },
+  "keywords": [
+    "devops",
+    "ci",
+    "cd",
+    "github-actions",
+    "docker",
+    "git",
+    "opentofu",
+    "prometheus",
+    "security"
+  ]
 }

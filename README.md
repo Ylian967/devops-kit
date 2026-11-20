@@ -11,8 +11,7 @@ projet perso. On l'installe une fois ; ensuite, dans un projet :
 
 Un seul bloc : `/devops-kit:devops-apply <bloc>` (par exemple `/devops-kit:devops-apply ci`).
 
-> État : **phase 2**. Blocs disponibles : `git-collab`, `ci`, `docker-dev`, `cd-release`. Les blocs `iac`,
-> `monitoring` et `devsecops` (phase 3) apparaissent dans le diagnostic comme « pas encore disponibles ».
+Les sept blocs sont disponibles. Catalogue détaillé (dépendances, fichiers produits) : [`docs/BLOCS.md`](docs/BLOCS.md).
 
 ## Les blocs
 
@@ -22,6 +21,9 @@ Un seul bloc : `/devops-kit:devops-apply <bloc>` (par exemple `/devops-kit:devop
 | `ci` | `.github/workflows/ci.yml` : lint, format, tests, seuil de couverture, intégration contre une vraie base, build, docker-build, cache, concurrency, permissions minimales ; checks requis ajoutés au ruleset | `git-collab` |
 | `docker-dev` | Dockerfile multi-stage non root, `.dockerignore`, `compose.yaml` de dev avec healthchecks, route `/health` (503 si la base ne répond pas), `.env.example` | — |
 | `cd-release` | `release.yml` : image ghcr.io au SHA court, scan Trivy, staging auto puis production après approbation, smoke test et rollback auto ; `compose.prod.yaml`, `deploy/` (scripts, Nginx HTTPS), `dependabot.yml`, `docs/DEPLOIEMENT.md` ; cible runner self-hosted local ou VPS en SSH | `docker-dev` (+ `ci` conseillé) |
+| `iac` | Staging décrit en OpenTofu, `iac.yml` (fmt, validate, plan en commentaire de PR), Ansible en option pour préparer la machine | `cd-release` |
+| `monitoring` | `/metrics`, Prometheus, Grafana (dashboard provisionné), Alertmanager, blackbox, alertes API down / 5xx / latence testées par promtool, `docs/INCIDENTS.md` | `docker-dev` (+ `cd-release` conseillé) |
+| `devsecops` | `security.yml` (gitleaks, audit des dépendances, Semgrep, ZAP baseline), pre-commit gitleaks, en-têtes de sécurité, workflows épinglés par SHA, `docs/SECURITE.md` | `ci` (+ `cd-release` conseillé) |
 
 Stacks couvertes par chaque bloc : Node / Next.js, Next.js + Convex, Java (Maven, Gradle), Rust (cargo), Elixir (mix).
 
@@ -65,6 +67,7 @@ plugins/devops-kit/
   skills/<bloc>/SKILL.md               dépendances, signaux de détection, étapes, vérification, gestes manuels
   skills/<bloc>/references/            variantes par stack et explications
   skills/<bloc>/templates/             fichiers modèles commentés en français
+docs/BLOCS.md                          catalogue : bloc, dépendances, fichiers produits
 examples/node-api/                     mini-API Node sans aucun fichier DevOps, pour tester les blocs
 tests/                                 tests des scripts des templates (ex. tests/cd-release-deploy.sh, sans Docker)
 ```
@@ -86,11 +89,15 @@ claude --plugin-dir ~/projets/devops-kit/plugins/devops-kit
 # puis : /devops-kit:devops-plan
 ```
 
+Tester le plugin lui-même : `tests/cd-release-deploy.sh` (deploy.sh et son rollback, sans Docker), et
+`claude plugin validate` (voir plus haut).
+
 ## Inspiration
 
-Les principes (ruleset en code, squash et titre de PR conventionnel, conventional comments, CI aux noms de jobs
-stables servant de checks requis, service container avec healthcheck, seuil de couverture bloquant, moindre privilège
-des workflows…) viennent de la formation
+Les principes (ruleset en code, squash et titre de PR conventionnel, CI aux noms de jobs stables servant de checks
+requis, seuil de couverture bloquant, build once deploy many, smoke test et rollback, staging en IaC avec plan en PR,
+alertes testées et post-mortem sans blâme, secrets hors de Git, moindre privilège et actions épinglées…) viennent de
+la formation
 [Foreach-Academy-France/formation-cda-devops](https://github.com/Foreach-Academy-France/formation-cda-devops) (TP 1 Git
-collaboratif, fil rouge TaskFlow). Ce dépôt n'en recopie aucun fichier : les templates et les instructions sont écrits
+collaboratif, fil rouge TaskFlow étapes 0 à 5, exercices, démos, lab du runner). Ce dépôt n'en recopie aucun fichier : les templates et les instructions sont écrits
 pour devops-kit et généralisés à plusieurs stacks.

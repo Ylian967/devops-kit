@@ -62,7 +62,9 @@ jobs:
           components: llvm-tools-preview # requis par cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       # Binaire précompilé de cargo-llvm-cov (bien plus rapide qu'un cargo install)
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov # forme épinglable par SHA (bloc devsecops), suivie par Dependabot
       # Lance cargo test en mesurant la couverture ; échoue sous le seuil.
       # Les tests marqués #[ignore] (intégration) ne tournent pas ici.
       - name: Tests unitaires + couverture

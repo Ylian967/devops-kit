@@ -45,6 +45,7 @@ de façon cohérente.
 | OpenTofu | `infra/` : `versions.tf`, `providers.tf`, `variables.tf`, `main.tf`, `outputs.tf`, `terraform.tfvars.example` ; le state n'est jamais versionné |
 | Ansible | `ansible/` : `inventory.ini.example`, `site.yml`, `templates/` |
 | Monitoring | `monitoring/` : `prometheus/prometheus.yml`, `prometheus/rules/alertes.yml`, `prometheus/tests/`, `alertmanager/alertmanager.yml`, `blackbox/blackbox.yml`, `grafana/provisioning/…`, `grafana/dashboards/*.json` |
+| Sécurité | `.gitleaks.toml`, `.githooks/pre-commit` (gitleaks, à côté de `commit-msg`), `.zap/rules.tsv` ; variable de dépôt `STAGING_URL` (cible de ZAP) |
 | Documentation | `docs/DEPLOIEMENT.md`, `docs/INCIDENTS.md`, `docs/SECURITE.md` |
 
 ## Vérifier sans rien installer

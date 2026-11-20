@@ -12,19 +12,18 @@ Tout ce que tu écris à l'utilisateur est en français.
 
 ## Catalogue des blocs
 
-| Bloc | Rôle | Dépend de | Disponible |
-|---|---|---|---|
-| `git-collab` | Ruleset sur `main`, CODEOWNERS, template de PR, hook Conventional Commits, CONTRIBUTING.md | — | oui |
-| `ci` | `.github/workflows/ci.yml` : lint, format, tests, couverture, intégration, build | `git-collab` (checks requis) | oui |
-| `docker-dev` | Dockerfiles multi-stage, compose.yaml de dev, `/health`, `.env.example` | — | oui |
-| `cd-release` | Images ghcr.io, Trivy, staging puis prod avec approbation, smoke test, rollback, proxy HTTPS, Dependabot | `docker-dev` (+ `ci` conseillé) | oui |
-| `iac` | OpenTofu pour le staging, `iac.yml`, Ansible en option | `cd-release` | phase 3 |
-| `monitoring` | `/metrics`, Prometheus, Grafana, Alertmanager, blackbox, post-mortem | `docker-dev` | phase 3 |
-| `devsecops` | gitleaks, audit des dépendances, Semgrep, ZAP, durcissement des workflows | `ci` | phase 3 |
+| Bloc | Rôle | Dépend de |
+|---|---|---|
+| `git-collab` | Ruleset sur `main`, CODEOWNERS, template de PR, hook Conventional Commits, CONTRIBUTING.md | — |
+| `ci` | `.github/workflows/ci.yml` : lint, format, tests, couverture, intégration, build | `git-collab` (checks requis) |
+| `docker-dev` | Dockerfiles multi-stage, compose.yaml de dev, `/health`, `.env.example` | — |
+| `cd-release` | Images ghcr.io, Trivy, staging puis prod avec approbation, smoke test, rollback, proxy HTTPS, Dependabot | `docker-dev` (+ `ci` conseillé) |
+| `iac` | OpenTofu pour le staging, `iac.yml` (plan en commentaire de PR), Ansible en option | `cd-release` |
+| `monitoring` | `/metrics`, Prometheus, Grafana, Alertmanager, blackbox, post-mortem | `docker-dev` (+ `cd-release` conseillé) |
+| `devsecops` | gitleaks, audit des dépendances, Semgrep, ZAP, durcissement des workflows | `ci` (+ `cd-release` conseillé) |
 
 Chaque bloc disponible a sa skill : `${CLAUDE_PLUGIN_ROOT}/skills/<bloc>/SKILL.md`. Sa section
 **Signaux de détection** dit s'il s'applique et ce qui est déjà en place. Lis-la pour chaque bloc disponible.
-Un bloc « phase N » apparaît dans le tableau avec la mention *pas encore disponible* et n'est jamais proposé.
 
 ## Étape 1 : analyser le projet (lecture seule)
 
@@ -57,7 +56,7 @@ Puis identifie :
 Un résumé de 3 à 5 lignes (stack, base, remote, solo/équipe), puis ce tableau :
 
 | Bloc | Pertinent ? | Pourquoi | Déjà en place ? | Dépendances |
-|---|---|---|---|---|
+|---|---|---|
 
 - *Pertinent ?* : oui / non / optionnel, avec une raison concrète tirée du projet (pas une généralité).
 - *Déjà en place ?* : non / partiel (dire ce qui manque) / oui (dire quels fichiers).
@@ -85,7 +84,7 @@ Termine toujours par ce rapport, même si tout n'a pas marché :
 
 ### Fait
 | Bloc | Branche | Commit | PR | Vérifications |
-|---|---|---|---|---|
+|---|---|---|
 
 ### À faire à la main
 - [ ] … (secrets, approbateurs, runner, activation du hook dans les autres clones, etc. : reprendre la section
